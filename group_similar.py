@@ -33,7 +33,11 @@ Blending the measures (instead of AND-ing hard cutoffs) avoids the old
 "AND-gate" failure where a genuine same-shot pair was split because one coarse
 measure was a hair too far even though the others agreed.
 
-Groups are the connected components (union-find) of that "similar" relation.
+Groups are built with AVERAGE-LINKAGE (UPGMA) agglomerative clustering: two
+clusters merge only while the AVERAGE similarity between their members is high
+enough.  This is what prevents "chaining" — a frame similar to just ONE member
+of a group no longer drags a run of loosely-related frames together; such fringe
+frames drop out as singletons.
 
 Usage:
   # just give a folder path: every folder under it that holds images gets its
@@ -254,14 +258,21 @@ def build_groups(paths, bits_list, gray_list, edge_list, col_list,
                  w_hash=0.3, w_gray=0.4, w_edge=0.1, w_color=0.2,
                  sim_threshold=0.55, strong_gray_thresh=0.80, chunk=256,
                  progress=False, log_decisions=False):
-    """Union-find clustering of the "similar" relation.
+    """Average-linkage (UPGMA) agglomerative clustering of the "similar" relation.
 
-    Two photos are linked when their COMBINED similarity — a weighted blend of
-    pHash similarity, grayscale STRUCTURE correlation, edge correlation and
-    colour correlation — is at least `sim_threshold`, OR when their grayscale
-    structure correlation alone is at least `strong_gray_thresh` (near-identical
-    composition).  Blending (rather than AND-ing hard cutoffs) means a same-shot
-    pair no longer falls through the gap when one measure is a little off.
+    Unlike single-linkage union-find — which merges two clusters as soon as the
+    single closest pair crosses the threshold — average linkage merges only
+    while the AVERAGE similarity between the two clusters' members is high
+    enough.  That is what stops "chaining": a frame that is similar to just ONE
+    member of a group (an intermediate pose) no longer drags a whole run of
+    loosely-related frames into the same folder.  Such fringe frames fall out as
+    singletons instead.
+
+    The merge score is the COMBINED similarity (weighted blend of pHash,
+    grayscale structure, edge and colour); two clusters are also merged when
+    their average grayscale structure correlation alone is very high
+    (`strong_gray_thresh`), which keeps near-identical frames together even when
+    the combined blend dips.
 
     Returns (groups, GR) where groups is a list of index lists and GR is the
     (n x d) matrix of normalised grayscale vectors (used again for reporting).
@@ -274,73 +285,75 @@ def build_groups(paths, bits_list, gray_list, edge_list, col_list,
     bits = H.shape[1]
     dg, de, dc = GR.shape[1], ED.shape[1], CO.shape[1]
 
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
     # Precompute the transposed hash matrices once for the chunked products.
     notH = (1 - H).T        # bits x n
     Ht = H.T                # bits x n
 
+    # Full pairwise matrices (float32): combined similarity and structure corr.
+    S = np.empty((n, n), dtype=np.float32)
+    Gs = np.empty((n, n), dtype=np.float32)
     t0 = time.time()
     for i0 in range(0, n, chunk):
         i1 = min(n, i0 + chunk)
         A = H[i0:i1]                     # c x bits
         notA = 1 - A                     # c x bits
-        # Hamming distance for every pair in this row-chunk.
-        Dh = A @ notH + notA @ Ht        # c x n
+        Dh = A @ notH + notA @ Ht        # c x n (Hamming distance)
         hash_sim = 1.0 - Dh / bits       # c x n, in [0, 1]
-        # Correlations for every pair in this row-chunk.
         Cg = (GR[i0:i1] @ GR.T) / dg
         Ce = (ED[i0:i1] @ ED.T) / de
         Cc = (CO[i0:i1] @ CO.T) / dc
-        # Combined similarity across the four complementary signals.
-        combined = (w_hash * hash_sim + w_gray * Cg
-                    + w_edge * Ce + w_color * Cc)
-        # Group on a high combined score, or on near-identical structure alone.
-        mask = (combined >= sim_threshold) | (Cg >= strong_gray_thresh)
-        ys, xs = np.nonzero(mask)
-        for di, j in zip(ys.tolist(), xs.tolist()):
-            i = i0 + di
-            if j > i:
-                union(i, j)
-                if log_decisions:
-                    comb = float(combined[di, j])
-                    g = float(Cg[di, j])
-                    dh = int(Dh[di, j])
-                    if comb >= sim_threshold:
-                        why = (f"combined {comb:.3f}>={sim_threshold} "
-                               f"(struct {g:.3f}, pHash dist {dh})")
-                    else:
-                        why = (f"structure {g:.3f}>={strong_gray_thresh} "
-                               f"(strong; pHash dist {dh})")
-                    log.debug("LINK  %s  <->  %s  |  %s",
-                              os.path.basename(paths[i]),
-                              os.path.basename(paths[j]), why)
+        S[i0:i1] = w_hash * hash_sim + w_gray * Cg + w_edge * Ce + w_color * Cc
+        Gs[i0:i1] = Cg
         if progress and (i1 % (chunk * 8) == 0 or i1 == n):
             pct = 100 * i1 / n
             rate = i1 / max(time.time() - t0, 1e-6)
             eta = (n - i1) / rate if rate > 0 else 0
             print(f"    compared {i1}/{n} ({pct:.0f}%), ~{eta:.0f}s left")
+    np.fill_diagonal(S, 1.0)
+    np.fill_diagonal(Gs, 1.0)
 
-    groups = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(i)
+    # Average-linkage (UPGMA).  Sc/Gc hold the current average similarity
+    # between the clusters represented by active indices; Lance–Williams update.
+    Sc = S.copy()
+    Gc = Gs.copy()
+    size = np.ones(n, dtype=np.float64)
+    active = np.ones(n, dtype=bool)
+    members = [[i] for i in range(n)]
+
+    while True:
+        M = np.where(active[:, None] & active[None, :], Sc, -np.inf)
+        np.fill_diagonal(M, -np.inf)
+        Sgt = np.where(active[:, None] & active[None, :], Gc, -np.inf)
+        np.fill_diagonal(Sgt, -np.inf)
+        valid = (M >= sim_threshold) | (Sgt >= strong_gray_thresh)
+        score = np.where(valid, np.maximum(M, Sgt), -np.inf)
+        k = int(np.argmax(score))
+        a, b = divmod(k, n)
+        best = score[a, b]
+        if not np.isfinite(best):
+            break
+        mc, mg = float(M[a, b]), float(Sgt[a, b])
+        na, nb = size[a], size[b]
+        Sc[a, :] = (na * Sc[a, :] + nb * Sc[b, :]) / (na + nb)
+        Sc[:, a] = Sc[a, :]
+        Gc[a, :] = (na * Gc[a, :] + nb * Gc[b, :]) / (na + nb)
+        Gc[:, a] = Gc[a, :]
+        size[a] = na + nb
+        members[a] = members[a] + members[b]
+        active[b] = False
+        if log_decisions:
+            rule = ("combined avg %.3f >= %.2f" % (mc, sim_threshold)
+                    if mc >= sim_threshold
+                    else "structure avg %.3f >= %.2f" % (mg, strong_gray_thresh))
+            log.debug("MERGE  -> cluster size %d  (%s)", int(size[a]), rule)
+
+    groups = [members[i] for i in range(n) if active[i]]
 
     if log_decisions:
-        _log_cluster_reasons(paths, list(groups.values()), GR,
+        _log_cluster_reasons(paths, groups, GR,
                              argparse.Namespace(strong_gray_threshold=
                                                 strong_gray_thresh))
-    return list(groups.values()), GR
+    return groups, GR
 
 
 def pick_representative(members, GR):
