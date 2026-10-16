@@ -40,6 +40,7 @@ aggressively; do the opposite to be stricter).
 
 import argparse
 import csv
+import logging
 import os
 import shutil
 import sys
@@ -54,10 +55,11 @@ from openpyxl.utils import get_column_letter
 
 
 # Windows-safe console: force UTF-8 with a lossy fallback so non-ASCII filenames
-# never crash printing on a cp1252 console.
+# never crash printing on a cp1252 console.  line_buffering makes every print
+# show up immediately (no "looks stuck" while a long phase runs silently).
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 except Exception:
     pass
 
@@ -74,6 +76,30 @@ TAG_DATETIME_ORIGINAL = 36867  # DateTimeOriginal (capture time)
 # Colours used to tint each group in the Excel sheet
 PALETTE = ["D9E1F2", "FCE4D6", "E2EFDA", "FFF2CC", "EDEDED",
            "DDEBF7", "FDE9D9", "E4DFEC", "DCE6F1", "F2DCDB"]
+
+# Module logger.  Console progress is still printed directly; the log file
+# records the full story: what was scanned, which photos matched, and WHY (or
+# why a photo ended up a singleton).
+log = logging.getLogger("group_similar")
+
+
+def setup_logging(log_path):
+    """Send detailed DEBUG logging to `log_path` (created/overwritten).
+
+    Returns the path on success, or None if the file could not be opened.
+    """
+    log.setLevel(logging.DEBUG)
+    log.handlers.clear()
+    log.propagate = False
+    try:
+        fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    except Exception:
+        return None
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    log.addHandler(fh)
+    return log_path
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +168,8 @@ def features_of(path, hash_size, grid):
         vec = np.concatenate(chans)
         bits = np.asarray(ph.hash, dtype=np.int8).ravel()
         return bits, vec
-    except Exception:
+    except Exception as e:
+        log.warning("cannot read '%s': %s: %s", path, type(e).__name__, e)
         return None, None
 
 
@@ -170,8 +197,41 @@ def find_image_folders(root, out_name):
 # --------------------------------------------------------------------------- #
 # Grouping core
 # --------------------------------------------------------------------------- #
+def _log_cluster_reasons(paths, groups, H, G, phash_thresh, corr_thresh,
+                         strong_corr_thresh):
+    """Write a human-readable "why" for every group and every singleton."""
+    d = G.shape[1]
+    multi = sorted((g for g in groups if len(g) > 1), key=len, reverse=True)
+    singles = [g[0] for g in groups if len(g) == 1]
+
+    log.info("cluster summary: %d multi-photo group(s), %d singleton(s)",
+             len(multi), len(singles))
+    for rank, members in enumerate(multi, 1):
+        names = ", ".join(os.path.basename(paths[i]) for i in members)
+        log.info("GROUP %02d  size=%d  members: %s", rank, len(members), names)
+
+    for i in singles:
+        corr = (G @ G[i]) / d
+        corr[i] = -2.0
+        j = int(np.argmax(corr))
+        c = float(corr[j])
+        dh = int(np.count_nonzero(H[i] != H[j]))
+        misses = []
+        if dh > phash_thresh:
+            misses.append(f"pHash dist {dh} > {phash_thresh}")
+        if c < corr_thresh:
+            misses.append(f"colour corr {c:.3f} < {corr_thresh}")
+        if c < strong_corr_thresh:
+            misses.append(f"colour corr {c:.3f} < {strong_corr_thresh} (strong)")
+        log.debug("SINGLE  %s  | closest %s: pHash dist %d, colour corr %.3f "
+                  "-> not grouped because %s",
+                  os.path.basename(paths[i]), os.path.basename(paths[j]),
+                  dh, c, "; ".join(misses) or "no qualifying partner")
+
+
 def build_groups(paths, bits_list, vecs_list, phash_thresh, corr_thresh,
-                 strong_corr_thresh=0.95, chunk=256):
+                 strong_corr_thresh=0.95, chunk=256, progress=False,
+                 log_decisions=False):
     """Union-find clustering of the "similar" relation.
 
     Returns (groups, G) where groups is a list of index lists and G is the
@@ -199,6 +259,7 @@ def build_groups(paths, bits_list, vecs_list, phash_thresh, corr_thresh,
     notH = (1 - H).T        # bits x n
     Ht = H.T               # bits x n
 
+    t0 = time.time()
     for i0 in range(0, n, chunk):
         i1 = min(n, i0 + chunk)
         A = H[i0:i1]                     # c x bits
@@ -214,10 +275,31 @@ def build_groups(paths, bits_list, vecs_list, phash_thresh, corr_thresh,
             i = i0 + di
             if j > i:
                 union(i, j)
+                if log_decisions:
+                    dh = int(Dh[di, j])
+                    c = float(C[di, j])
+                    if dh <= phash_thresh and c >= corr_thresh:
+                        why = (f"tier A (pHash dist {dh}<={phash_thresh} and "
+                               f"colour corr {c:.3f}>={corr_thresh})")
+                    else:
+                        why = (f"tier B (colour corr {c:.3f}>="
+                               f"{strong_corr_thresh}, pHash dist {dh})")
+                    log.debug("LINK  %s  <->  %s  |  %s",
+                              os.path.basename(paths[i]),
+                              os.path.basename(paths[j]), why)
+        if progress and (i1 % (chunk * 8) == 0 or i1 == n):
+            pct = 100 * i1 / n
+            rate = i1 / max(time.time() - t0, 1e-6)
+            eta = (n - i1) / rate if rate > 0 else 0
+            print(f"    compared {i1}/{n} ({pct:.0f}%), ~{eta:.0f}s left")
 
     groups = {}
     for i in range(n):
         groups.setdefault(find(i), []).append(i)
+
+    if log_decisions:
+        _log_cluster_reasons(paths, list(groups.values()), H, G,
+                             phash_thresh, corr_thresh, strong_corr_thresh)
     return list(groups.values()), G
 
 
@@ -243,27 +325,50 @@ def process_folder(folder, out_dir, args):
 
     print(f"  folder : {folder}")
     print(f"  images : {len(paths)}")
+    log.info("")
+    log.info("FOLDER %s  (%d image(s))", folder, len(paths))
 
+    # ---- Phase 1: read each image and build its fingerprint ---------------- #
+    print(f"  [1/3] fingerprinting {len(paths)} image(s) ...")
     keep, bits_list, vecs_list = [], [], []
-    for p in paths:
+    total = len(paths)
+    t1 = time.time()
+    for idx, p in enumerate(paths, 1):
+        name = os.path.basename(p)
         b, v = features_of(p, args.hash_size, args.grid)
         if b is None:
-            print(f"    [warn] unreadable: {os.path.basename(p)}")
+            print(f"    [{idx}/{total}] [warn] unreadable: {name}")
+            log.warning("SKIP unreadable [%d/%d]: %s", idx, total, name)
             continue
         keep.append(p)
         bits_list.append(b)
         vecs_list.append(v)
+        if idx % 25 == 0 or idx == total:
+            rate = idx / max(time.time() - t1, 1e-6)
+            eta = (total - idx) / rate if rate > 0 else 0
+            print(f"    [{idx}/{total}] {rate:.1f} img/s, ~{eta:.0f}s left "
+                  f"- {name}")
     paths = keep
     if not paths:
         print("  [skip] nothing readable")
         return None
+    print(f"  [1/3] done in {time.time() - t1:.1f}s "
+          f"({len(paths)} fingerprint(s))")
 
-    print(f"  clustering {len(paths)} image(s) "
+    # ---- Phase 2: cluster -------------------------------------------------- #
+    pairs = len(paths) * (len(paths) - 1) // 2
+    print(f"  [2/3] clustering {len(paths)} image(s) ({pairs} pairs) "
           f"(phash<= {args.phash_threshold} & corr>= {args.corr_threshold}, "
           f"or corr>= {args.strong_corr_threshold}) ...")
+    t2 = time.time()
     groups, G = build_groups(paths, bits_list, vecs_list,
                              args.phash_threshold, args.corr_threshold,
-                             args.strong_corr_threshold)
+                             args.strong_corr_threshold, progress=True,
+                             log_decisions=True)
+    print(f"  [2/3] done in {time.time() - t2:.1f}s "
+          f"({len(groups)} raw cluster(s))")
+    log.info("[2/3] clustered %d image(s) into %d raw cluster(s) in %.1fs",
+             len(paths), len(groups), time.time() - t2)
 
     # capture-time cache (used for ordering + report)
     ctime = {}
@@ -299,6 +404,7 @@ def process_folder(folder, out_dir, args):
         dest = os.path.join(dest_dir, base)
         shutil.copy2(src, dest)
 
+    print(f"  [3/3] writing {len(groups)} cluster(s) to '{out_dir}' ...")
     rows = []          # (group_id, file, group_size, similarity, capture_time)
     n_groups = 0
     n_singletons = 0
@@ -380,6 +486,8 @@ def process_folder(folder, out_dir, args):
     print(f"  output           : {out_dir}")
     print(f"  report           : {csv_path}")
     print(f"  done in {time.time() - t0:.1f}s")
+    log.info("[3/3] wrote %d group(s) + %d singleton(s) to %s",
+             n_groups, n_singletons, out_dir)
 
     return {
         "folder": folder,
@@ -438,25 +546,50 @@ def main():
     if not folders:
         sys.exit(f"error: no folders containing images found under '{root}'")
 
+    log_path = setup_logging(os.path.join(root, "group_similar.log"))
+    log.info("=== group_similar run start ===")
+    log.info("root=%s  out_name=%s  python=%s", os.path.abspath(root),
+             args.out_name, sys.version.split()[0])
+    log.info("settings: hash_size=%d phash<=%d corr>=%.2f strong_corr>=%.2f "
+             "grid=%d min_group_size=%d singletons=%s",
+             args.hash_size, args.phash_threshold, args.corr_threshold,
+             args.strong_corr_threshold, args.grid, args.min_group_size,
+             args.singletons)
+    log.info("image folders found (%d):", len(folders))
+    for f in folders:
+        log.info("  - %s", os.path.relpath(f, root))
+
     print(f"Found {len(folders)} folder(s) with images under '{root}'")
+    if log_path:
+        print(f"  log              : {log_path}")
+    for i, f in enumerate(folders, 1):
+        print(f"  {i:>3}. {os.path.relpath(f, root)}")
 
     summaries = []
-    for folder in folders:
+    n_folders = len(folders)
+    run_t0 = time.time()
+    for fi, folder in enumerate(folders, 1):
         # Group folders are created INSIDE each image folder.
         out_dir = os.path.join(folder, args.out_name)
         rel = os.path.relpath(folder, root)
         print()
         print("=" * 66)
-        print(f" {rel}")
+        print(f" [{fi}/{n_folders}] {rel}")
         print("=" * 66)
         s = process_folder(folder, out_dir, args)
         if s:
             summaries.append(s)
+        elapsed = time.time() - run_t0
+        print(f"  progress: {fi}/{n_folders} folder(s) done, "
+              f"{elapsed:.1f}s elapsed")
 
     print("\n=== Done ===")
     tot_images = sum(s["images"] for s in summaries)
     tot_groups = sum(s["groups"] for s in summaries)
     tot_single = sum(s["singletons"] for s in summaries)
+    log.info("=== run done: %d image(s) -> %d group(s), %d singleton(s) "
+             "across %d folder(s) ===",
+             tot_images, tot_groups, tot_single, len(summaries))
     print(f"{tot_images} image(s) -> {tot_groups} group(s), "
           f"{tot_single} singleton(s) across {len(summaries)} folder(s).")
 
