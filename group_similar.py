@@ -8,21 +8,30 @@ Given a folder of photos, this finds groups of near-duplicate / same-scene
 photos and copies each group into its own sub-folder, plus a CSV/XLSX report.
 The source files are never moved, renamed or modified — they are only copied.
 
-Similarity is measured 100% locally (no cloud, no cost, no API key):
+Similarity is measured 100% locally (no cloud, no cost, no API key) using a
+blend of FOUR complementary, content-aware signals:
 
-  1. pHash (perceptual hash) .......... coarse, rotation-normalised, cheap.
-  2. Colour correlation on a grid ..... finer, colour-aware detail, used to
-                                        CONFIRM a candidate really is the
-                                        same shot (not just a similar scene).
+  1. pHash (perceptual hash) ......... coarse, rotation-normalised, cheap.
+  2. Grayscale STRUCTURE correlation . the dominant signal: the whole frame is
+                                       downscaled and contrast-normalised, so
+                                       COMPOSITION is compared directly.  An
+                                       extra person, a missing prop or a
+                                       different crop changes the structure and
+                                       lowers this score — exactly the "same
+                                       scene but not the same shot" case.
+  3. Edge correlation ................ captures outlines / object boundaries.
+  4. Colour correlation on a grid .... colour-aware detail (backdrop, outfit).
 
 Two photos join the same group when EITHER:
-  * their pHash Hamming distance <= --phash-threshold AND
-    their colour correlation      >= --corr-threshold (default 0.80),  -- or
-  * their colour correlation      >= --strong-corr-threshold (default 0.95).
+  * their COMBINED similarity — a weighted blend of the four measures above,
+    weighted by --w-hash / --w-gray / --w-edge / --w-color — is
+    >= --sim-threshold (default 0.55),  -- or
+  * their grayscale structure correlation alone is
+    >= --strong-gray-threshold (default 0.80) (near-identical composition).
 
-The first (tier A) is the conservative default. The second (tier B) lets two
-frames that are near-identical in colour layout group even when the coarse pHash
-disagrees, which makes burst grouping robust to small framing/sensor changes.
+Blending the measures (instead of AND-ing hard cutoffs) avoids the old
+"AND-gate" failure where a genuine same-shot pair was split because one coarse
+measure was a hair too far even though the others agreed.
 
 Groups are the connected components (union-find) of that "similar" relation.
 
@@ -34,8 +43,8 @@ Usage:
   # or point at one shoot folder
   python3 group_similar.py "input_folder/Paltu/Edit"
 
-Tuning (raise --phash-threshold / lower --corr-threshold to group more
-aggressively; do the opposite to be stricter).
+Tuning (lower --sim-threshold to group more aggressively; raise it to be
+stricter).
 """
 
 import argparse
@@ -143,34 +152,47 @@ def read_capture_time(path):
     return None
 
 
-def features_of(path, hash_size, grid):
-    """Return (phash_bits, color_vec) for one image, or (None, None) on failure.
+def _nz(a):
+    """Flatten `a` and return it zero-mean / unit-std (a normalised vector)."""
+    a = a.ravel()
+    return (a - a.mean()) / (a.std() + 1e-6)
+
+
+def features_of(path, hash_size, struct_grid, color_grid):
+    """Return (phash_bits, gray_vec, edge_vec, color_vec) for one image.
+
+    Returns (None, None, None, None) on failure.
 
     Orientation is normalised (EXIF transpose) so rotated copies still match.
+    Every vector is zero-mean / unit-std so a plain normalised dot product IS
+    the correlation (a value in [-1, 1]).
 
-    color_vec is a COLOUR-aware vector: the image is downscaled to grid x grid
-    RGB and each channel is zero-mean / unit-std before flattening, so
-    correlation is a plain normalised dot product. Using colour (not just
-    grayscale) matters here: two otherwise similar compositions with a
-    different backdrop or outfit are *different takes*, not one group.
+    * gray_vec  — the downscaled grayscale frame.  This is the main signal:
+                  it compares actual COMPOSITION, so an extra/missing person or
+                  object, or a different crop, drops the score.
+    * edge_vec  — gradient magnitude, emphasising outlines / object boundaries.
+    * color_vec — downscaled RGB, colour-aware (backdrop / outfit differences).
     """
     try:
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im)
             g = im.convert("L")
             ph = imagehash.phash(g, hash_size=hash_size)
-            small = im.convert("RGB").resize((grid, grid), Image.BILINEAR)
-            a = np.asarray(small, dtype=np.float32)  # grid x grid x 3
-        chans = []
-        for c in range(3):
-            ch = a[:, :, c].ravel()
-            chans.append((ch - ch.mean()) / (ch.std() + 1e-6))
-        vec = np.concatenate(chans)
+            gray = np.asarray(g.resize((struct_grid, struct_grid), Image.BILINEAR),
+                              dtype=np.float32)
+            gy, gx = np.gradient(gray)
+            edge = np.hypot(gx, gy)
+            col = np.asarray(
+                im.convert("RGB").resize((color_grid, color_grid), Image.BILINEAR),
+                dtype=np.float32)
+        gray_v = _nz(gray)
+        edge_v = _nz(edge)
+        col_v = np.concatenate([_nz(col[:, :, c]) for c in range(3)])
         bits = np.asarray(ph.hash, dtype=np.int8).ravel()
-        return bits, vec
+        return bits, gray_v, edge_v, col_v
     except Exception as e:
         log.warning("cannot read '%s': %s: %s", path, type(e).__name__, e)
-        return None, None
+        return None, None, None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -197,10 +219,13 @@ def find_image_folders(root, out_name):
 # --------------------------------------------------------------------------- #
 # Grouping core
 # --------------------------------------------------------------------------- #
-def _log_cluster_reasons(paths, groups, H, G, phash_thresh, corr_thresh,
-                         strong_corr_thresh):
+def _weights(args):
+    return (args.w_hash, args.w_gray, args.w_edge, args.w_color)
+
+
+def _log_cluster_reasons(paths, groups, GR, args):
     """Write a human-readable "why" for every group and every singleton."""
-    d = G.shape[1]
+    d = GR.shape[1]
     multi = sorted((g for g in groups if len(g) > 1), key=len, reverse=True)
     singles = [g[0] for g in groups if len(g) == 1]
 
@@ -211,36 +236,43 @@ def _log_cluster_reasons(paths, groups, H, G, phash_thresh, corr_thresh,
         log.info("GROUP %02d  size=%d  members: %s", rank, len(members), names)
 
     for i in singles:
-        corr = (G @ G[i]) / d
-        corr[i] = -2.0
-        j = int(np.argmax(corr))
-        c = float(corr[j])
-        dh = int(np.count_nonzero(H[i] != H[j]))
+        sims = (GR @ GR[i]) / d
+        sims[i] = -2.0
+        j = int(np.argmax(sims))
+        c = float(sims[j])
         misses = []
-        if dh > phash_thresh:
-            misses.append(f"pHash dist {dh} > {phash_thresh}")
-        if c < corr_thresh:
-            misses.append(f"colour corr {c:.3f} < {corr_thresh}")
-        if c < strong_corr_thresh:
-            misses.append(f"colour corr {c:.3f} < {strong_corr_thresh} (strong)")
-        log.debug("SINGLE  %s  | closest %s: pHash dist %d, colour corr %.3f "
+        if c < args.strong_gray_threshold:
+            misses.append(f"structure corr {c:.3f} < "
+                          f"{args.strong_gray_threshold} (strong)")
+        log.debug("SINGLE  %s  | closest %s: structure corr %.3f "
                   "-> not grouped because %s",
                   os.path.basename(paths[i]), os.path.basename(paths[j]),
-                  dh, c, "; ".join(misses) or "no qualifying partner")
+                  c, "; ".join(misses) or "no qualifying partner")
 
 
-def build_groups(paths, bits_list, vecs_list, phash_thresh, corr_thresh,
-                 strong_corr_thresh=0.95, chunk=256, progress=False,
-                 log_decisions=False):
+def build_groups(paths, bits_list, gray_list, edge_list, col_list,
+                 w_hash=0.3, w_gray=0.4, w_edge=0.1, w_color=0.2,
+                 sim_threshold=0.55, strong_gray_thresh=0.80, chunk=256,
+                 progress=False, log_decisions=False):
     """Union-find clustering of the "similar" relation.
 
-    Returns (groups, G) where groups is a list of index lists and G is the
-    (n x d) matrix of normalised colour vectors (used again for reporting).
+    Two photos are linked when their COMBINED similarity — a weighted blend of
+    pHash similarity, grayscale STRUCTURE correlation, edge correlation and
+    colour correlation — is at least `sim_threshold`, OR when their grayscale
+    structure correlation alone is at least `strong_gray_thresh` (near-identical
+    composition).  Blending (rather than AND-ing hard cutoffs) means a same-shot
+    pair no longer falls through the gap when one measure is a little off.
+
+    Returns (groups, GR) where groups is a list of index lists and GR is the
+    (n x d) matrix of normalised grayscale vectors (used again for reporting).
     """
     n = len(paths)
-    H = np.stack(bits_list).astype(np.int32)        # n x bits (0/1)
-    G = np.stack(vecs_list).astype(np.float32)      # n x d  (normalised rows)
-    d = G.shape[1]
+    H = np.stack(bits_list).astype(np.int32)     # n x bits (0/1)
+    GR = np.stack(gray_list).astype(np.float32)  # n x dg (normalised rows)
+    ED = np.stack(edge_list).astype(np.float32)  # n x de
+    CO = np.stack(col_list).astype(np.float32)   # n x dc
+    bits = H.shape[1]
+    dg, de, dc = GR.shape[1], ED.shape[1], CO.shape[1]
 
     parent = list(range(n))
 
@@ -255,9 +287,9 @@ def build_groups(paths, bits_list, vecs_list, phash_thresh, corr_thresh,
         if ra != rb:
             parent[rb] = ra
 
-    # Precompute the transposed matrices once for the chunked distance products.
+    # Precompute the transposed hash matrices once for the chunked products.
     notH = (1 - H).T        # bits x n
-    Ht = H.T               # bits x n
+    Ht = H.T                # bits x n
 
     t0 = time.time()
     for i0 in range(0, n, chunk):
@@ -266,24 +298,31 @@ def build_groups(paths, bits_list, vecs_list, phash_thresh, corr_thresh,
         notA = 1 - A                     # c x bits
         # Hamming distance for every pair in this row-chunk.
         Dh = A @ notH + notA @ Ht        # c x n
-        # Colour correlation for every pair in this row-chunk.
-        C = (G[i0:i1] @ G.T) / d         # c x n
-        # Tier A: pHash and colour agree.  Tier B: colour is near-identical.
-        mask = ((Dh <= phash_thresh) & (C >= corr_thresh)) | (C >= strong_corr_thresh)
+        hash_sim = 1.0 - Dh / bits       # c x n, in [0, 1]
+        # Correlations for every pair in this row-chunk.
+        Cg = (GR[i0:i1] @ GR.T) / dg
+        Ce = (ED[i0:i1] @ ED.T) / de
+        Cc = (CO[i0:i1] @ CO.T) / dc
+        # Combined similarity across the four complementary signals.
+        combined = (w_hash * hash_sim + w_gray * Cg
+                    + w_edge * Ce + w_color * Cc)
+        # Group on a high combined score, or on near-identical structure alone.
+        mask = (combined >= sim_threshold) | (Cg >= strong_gray_thresh)
         ys, xs = np.nonzero(mask)
         for di, j in zip(ys.tolist(), xs.tolist()):
             i = i0 + di
             if j > i:
                 union(i, j)
                 if log_decisions:
+                    comb = float(combined[di, j])
+                    g = float(Cg[di, j])
                     dh = int(Dh[di, j])
-                    c = float(C[di, j])
-                    if dh <= phash_thresh and c >= corr_thresh:
-                        why = (f"tier A (pHash dist {dh}<={phash_thresh} and "
-                               f"colour corr {c:.3f}>={corr_thresh})")
+                    if comb >= sim_threshold:
+                        why = (f"combined {comb:.3f}>={sim_threshold} "
+                               f"(struct {g:.3f}, pHash dist {dh})")
                     else:
-                        why = (f"tier B (colour corr {c:.3f}>="
-                               f"{strong_corr_thresh}, pHash dist {dh})")
+                        why = (f"structure {g:.3f}>={strong_gray_thresh} "
+                               f"(strong; pHash dist {dh})")
                     log.debug("LINK  %s  <->  %s  |  %s",
                               os.path.basename(paths[i]),
                               os.path.basename(paths[j]), why)
@@ -298,16 +337,17 @@ def build_groups(paths, bits_list, vecs_list, phash_thresh, corr_thresh,
         groups.setdefault(find(i), []).append(i)
 
     if log_decisions:
-        _log_cluster_reasons(paths, list(groups.values()), H, G,
-                             phash_thresh, corr_thresh, strong_corr_thresh)
-    return list(groups.values()), G
+        _log_cluster_reasons(paths, list(groups.values()), GR,
+                             argparse.Namespace(strong_gray_threshold=
+                                                strong_gray_thresh))
+    return list(groups.values()), GR
 
 
-def pick_representative(members, G):
+def pick_representative(members, GR):
     """Return the medoid index: the member most similar to all the others."""
     if len(members) == 1:
         return members[0]
-    sub = G[members]                              # m x d
+    sub = GR[members]                             # m x d
     sims = (sub @ sub.T) / sub.shape[1]           # m x m correlations
     np.fill_diagonal(sims, -2.0)
     return members[int(np.argmax(sims.mean(axis=1)))]
@@ -330,19 +370,22 @@ def process_folder(folder, out_dir, args):
 
     # ---- Phase 1: read each image and build its fingerprint ---------------- #
     print(f"  [1/3] fingerprinting {len(paths)} image(s) ...")
-    keep, bits_list, vecs_list = [], [], []
+    keep, bits_list, gray_list, edge_list, col_list = [], [], [], [], []
     total = len(paths)
     t1 = time.time()
     for idx, p in enumerate(paths, 1):
         name = os.path.basename(p)
-        b, v = features_of(p, args.hash_size, args.grid)
+        b, gv, ev, cv = features_of(p, args.hash_size, args.struct_grid,
+                                    args.grid)
         if b is None:
             print(f"    [{idx}/{total}] [warn] unreadable: {name}")
             log.warning("SKIP unreadable [%d/%d]: %s", idx, total, name)
             continue
         keep.append(p)
         bits_list.append(b)
-        vecs_list.append(v)
+        gray_list.append(gv)
+        edge_list.append(ev)
+        col_list.append(cv)
         if idx % 25 == 0 or idx == total:
             rate = idx / max(time.time() - t1, 1e-6)
             eta = (total - idx) / rate if rate > 0 else 0
@@ -358,13 +401,15 @@ def process_folder(folder, out_dir, args):
     # ---- Phase 2: cluster -------------------------------------------------- #
     pairs = len(paths) * (len(paths) - 1) // 2
     print(f"  [2/3] clustering {len(paths)} image(s) ({pairs} pairs) "
-          f"(phash<= {args.phash_threshold} & corr>= {args.corr_threshold}, "
-          f"or corr>= {args.strong_corr_threshold}) ...")
+          f"(combined>= {args.sim_threshold}, weights h/g/e/c = "
+          f"{args.w_hash}/{args.w_gray}/{args.w_edge}/{args.w_color}, "
+          f"or struct>= {args.strong_gray_threshold}) ...")
     t2 = time.time()
-    groups, G = build_groups(paths, bits_list, vecs_list,
-                             args.phash_threshold, args.corr_threshold,
-                             args.strong_corr_threshold, progress=True,
-                             log_decisions=True)
+    groups, GR = build_groups(paths, bits_list, gray_list, edge_list, col_list,
+                              args.w_hash, args.w_gray, args.w_edge,
+                              args.w_color, args.sim_threshold,
+                              args.strong_gray_threshold, progress=True,
+                              log_decisions=True)
     print(f"  [2/3] done in {time.time() - t2:.1f}s "
           f"({len(groups)} raw cluster(s))")
     log.info("[2/3] clustered %d image(s) into %d raw cluster(s) in %.1fs",
@@ -412,7 +457,7 @@ def process_folder(folder, out_dir, args):
 
     for members in groups:
         size = len(members)
-        rep = pick_representative(members, G)
+        rep = pick_representative(members, GR)
         is_single = size < args.min_group_size
 
         if is_single:
@@ -434,15 +479,17 @@ def process_folder(folder, out_dir, args):
             dest_dir = os.path.join(out_dir, f"group_{gid}")
 
         for m in members:
-            sim = 1.0 if m == rep else float((G[m] @ G[rep]) / G.shape[1])
+            sim = 1.0 if m == rep else float((GR[m] @ GR[rep]) / GR.shape[1])
             place(paths[m], dest_dir)
-            rows.append((gid, os.path.basename(paths[m]), size, round(sim, 3), ct(m)))
+            rows.append((gid, os.path.basename(paths[m]), size,
+                         round(sim, 3), ct(m)))
 
     # ---- CSV report ------------------------------------------------------ #
     csv_path = os.path.join(out_dir, "groups.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["group_id", "file", "group_size", "similarity", "capture_time"])
+        w.writerow(["group_id", "file", "group_size", "similarity",
+                    "capture_time"])
         w.writerows(rows)
 
     # ---- Excel report ---------------------------------------------------- #
@@ -471,7 +518,8 @@ def process_folder(folder, out_dir, args):
                 color_for[gid] = PALETTE[idx % len(PALETTE)]
         ws.append([gid, fname, size, sim, ctv])
         fill = color_for[gid]
-        ws.cell(row=ws.max_row, column=1).fill = PatternFill("solid", fgColor=fill)
+        ws.cell(row=ws.max_row, column=1).fill = PatternFill("solid",
+                                                             fgColor=fill)
 
     for i, w in enumerate([14, 34, 12, 12, 22], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -518,17 +566,34 @@ def build_parser():
                         f"folder (default: {DEFAULT_OUT_NAME})")
     p.add_argument("--hash-size", type=int, default=8,
                    help="pHash bits per side (default 8 -> 64-bit hash)")
-    p.add_argument("--phash-threshold", type=int, default=10,
-                   help="max pHash Hamming distance to be a candidate (default 10)")
-    p.add_argument("--corr-threshold", type=float, default=0.80,
-                   help="min colour correlation when pHash also agrees (default 0.80)")
-    p.add_argument("--strong-corr-threshold", type=float, default=0.95,
-                   help="min colour correlation to group on its own, even if pHash "
-                        "disagrees (default 0.95)")
+    p.add_argument("--sim-threshold", type=float, default=0.55,
+                   help="min COMBINED similarity (weighted blend of pHash, "
+                        "structure, edge and colour) to group two photos; "
+                        "lower = group more (default 0.55)")
+    p.add_argument("--w-hash", type=float, default=0.3,
+                   help="weight of pHash similarity in the combined score "
+                        "(default 0.3)")
+    p.add_argument("--w-gray", type=float, default=0.4,
+                   help="weight of grayscale STRUCTURE correlation (the main "
+                        "signal) in the combined score (default 0.4)")
+    p.add_argument("--w-edge", type=float, default=0.1,
+                   help="weight of edge/outline correlation in the combined "
+                        "score (default 0.1)")
+    p.add_argument("--w-color", type=float, default=0.2,
+                   help="weight of colour correlation in the combined score "
+                        "(default 0.2)")
+    p.add_argument("--strong-gray-threshold", type=float, default=0.80,
+                   help="min grayscale structure correlation to group two "
+                        "photos on its own, even if the combined score is low "
+                        "(default 0.80)")
     p.add_argument("--grid", type=int, default=16,
-                   help="colour grid size for correlation, grid x grid (default 16)")
+                   help="colour correlation grid size, grid x grid (default 16)")
+    p.add_argument("--struct-grid", type=int, default=48,
+                   help="grayscale structure grid size, grid x grid "
+                        "(default 48)")
     p.add_argument("--min-group-size", type=int, default=2,
-                   help="a group must have at least this many photos (default 2)")
+                   help="a group must have at least this many photos "
+                        "(default 2)")
     p.add_argument("--singletons", default="separate",
                    choices=["separate", "group", "skip"],
                    help="what to do with photos that have no similar partner "
@@ -550,11 +615,12 @@ def main():
     log.info("=== group_similar run start ===")
     log.info("root=%s  out_name=%s  python=%s", os.path.abspath(root),
              args.out_name, sys.version.split()[0])
-    log.info("settings: hash_size=%d phash<=%d corr>=%.2f strong_corr>=%.2f "
-             "grid=%d min_group_size=%d singletons=%s",
-             args.hash_size, args.phash_threshold, args.corr_threshold,
-             args.strong_corr_threshold, args.grid, args.min_group_size,
-             args.singletons)
+    log.info("settings: hash_size=%d sim>=%.2f weights h/g/e/c="
+             "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f grid=%d struct_grid=%d "
+             "min_group_size=%d singletons=%s",
+             args.hash_size, args.sim_threshold, args.w_hash, args.w_gray,
+             args.w_edge, args.w_color, args.strong_gray_threshold, args.grid,
+             args.struct_grid, args.min_group_size, args.singletons)
     log.info("image folders found (%d):", len(folders))
     for f in folders:
         log.info("  - %s", os.path.relpath(f, root))
