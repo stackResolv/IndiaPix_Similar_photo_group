@@ -254,9 +254,48 @@ def _log_cluster_reasons(paths, groups, GR, args):
                   c, "; ".join(misses) or "no qualifying partner")
 
 
+def _average_linkage(S, Gs, ids, thr, strong_thr):
+    """Average-linkage (UPGMA) over the subset `ids`.
+
+    Two clusters merge while their AVERAGE combined similarity (matrix `S`) is
+    >= `thr`, or their average structure correlation (matrix `Gs`) is
+    >= `strong_thr`.  Returns a list of index-lists (global indices).
+    """
+    ids = list(ids)
+    m = len(ids)
+    if m <= 1:
+        return [ids]
+    Sc = S[np.ix_(ids, ids)].astype(np.float64).copy()
+    Gc = Gs[np.ix_(ids, ids)].astype(np.float64).copy()
+    size = np.ones(m, dtype=np.float64)
+    active = np.ones(m, dtype=bool)
+    members = [[k] for k in range(m)]
+    while True:
+        M = np.where(active[:, None] & active[None, :], Sc, -np.inf)
+        np.fill_diagonal(M, -np.inf)
+        Q = np.where(active[:, None] & active[None, :], Gc, -np.inf)
+        np.fill_diagonal(Q, -np.inf)
+        valid = (M >= thr) | (Q >= strong_thr)
+        score = np.where(valid, np.maximum(M, Q), -np.inf)
+        k = int(np.argmax(score))
+        a, b = divmod(k, m)
+        if not np.isfinite(score[a, b]):
+            break
+        na, nb = size[a], size[b]
+        Sc[a, :] = (na * Sc[a, :] + nb * Sc[b, :]) / (na + nb)
+        Sc[:, a] = Sc[a, :]
+        Gc[a, :] = (na * Gc[a, :] + nb * Gc[b, :]) / (na + nb)
+        Gc[:, a] = Gc[a, :]
+        size[a] = na + nb
+        members[a] = members[a] + members[b]
+        active[b] = False
+    return [[ids[k] for k in members[c]] for c in range(m) if active[c]]
+
+
 def build_groups(paths, bits_list, gray_list, edge_list, col_list,
                  w_hash=0.3, w_gray=0.4, w_edge=0.1, w_color=0.2,
-                 sim_threshold=0.55, strong_gray_thresh=0.80, chunk=256,
+                 sim_threshold=0.55, strong_gray_thresh=0.80,
+                 singleton_threshold=0.50, rescue_singletons=True, chunk=256,
                  progress=False, log_decisions=False):
     """Average-linkage (UPGMA) agglomerative clustering of the "similar" relation.
 
@@ -312,42 +351,36 @@ def build_groups(paths, bits_list, gray_list, edge_list, col_list,
     np.fill_diagonal(S, 1.0)
     np.fill_diagonal(Gs, 1.0)
 
-    # Average-linkage (UPGMA).  Sc/Gc hold the current average similarity
-    # between the clusters represented by active indices; Lance–Williams update.
-    Sc = S.copy()
-    Gc = Gs.copy()
-    size = np.ones(n, dtype=np.float64)
-    active = np.ones(n, dtype=bool)
-    members = [[i] for i in range(n)]
+    # Main pass: average-linkage (UPGMA) over every photo.
+    groups = _average_linkage(S, Gs, range(n), sim_threshold,
+                              strong_gray_thresh)
 
-    while True:
-        M = np.where(active[:, None] & active[None, :], Sc, -np.inf)
-        np.fill_diagonal(M, -np.inf)
-        Sgt = np.where(active[:, None] & active[None, :], Gc, -np.inf)
-        np.fill_diagonal(Sgt, -np.inf)
-        valid = (M >= sim_threshold) | (Sgt >= strong_gray_thresh)
-        score = np.where(valid, np.maximum(M, Sgt), -np.inf)
-        k = int(np.argmax(score))
-        a, b = divmod(k, n)
-        best = score[a, b]
-        if not np.isfinite(best):
-            break
-        mc, mg = float(M[a, b]), float(Sgt[a, b])
-        na, nb = size[a], size[b]
-        Sc[a, :] = (na * Sc[a, :] + nb * Sc[b, :]) / (na + nb)
-        Sc[:, a] = Sc[a, :]
-        Gc[a, :] = (na * Gc[a, :] + nb * Gc[b, :]) / (na + nb)
-        Gc[:, a] = Gc[a, :]
-        size[a] = na + nb
-        members[a] = members[a] + members[b]
-        active[b] = False
-        if log_decisions:
-            rule = ("combined avg %.3f >= %.2f" % (mc, sim_threshold)
-                    if mc >= sim_threshold
-                    else "structure avg %.3f >= %.2f" % (mg, strong_gray_thresh))
-            log.debug("MERGE  -> cluster size %d  (%s)", int(size[a]), rule)
-
-    groups = [members[i] for i in range(n) if active[i]]
+    # Rescue pass: re-cluster ONLY the leftover singletons at a slightly looser
+    # threshold, so a genuine near-match that just missed the main cut is not
+    # stranded alone.  It runs on the singleton subset only, so it never loosens
+    # the main groups — and therefore never re-introduces over-merging.
+    if rescue_singletons:
+        singles = [g[0] for g in groups if len(g) == 1]
+        if len(singles) > 1:
+            rescued = _average_linkage(S, Gs, singles, singleton_threshold,
+                                       strong_gray_thresh)
+            kept_multi = [g for g in groups if len(g) > 1]
+            rescued_multi = [g for g in rescued if len(g) > 1]
+            still_single = [[g[0]] for g in rescued if len(g) == 1]
+            if log_decisions and rescued_multi:
+                for g in rescued_multi:
+                    pairs = [(float(S[g[x], g[y]]), g[x], g[y])
+                             for x in range(len(g)) for y in range(x + 1, len(g))]
+                    pairs.sort(reverse=True)
+                    best = pairs[0]
+                    log.debug("RESCUE -> group of %d (best pair %s <-> %s "
+                              "combined %.3f)", len(g),
+                              os.path.basename(paths[best[1]]),
+                              os.path.basename(paths[best[2]]), best[0])
+            log.info("rescue pass: %d singleton(s) -> %d new group(s), %d still "
+                     "alone (threshold %.2f)", len(singles), len(rescued_multi),
+                     len(still_single), singleton_threshold)
+            groups = kept_multi + rescued_multi + still_single
 
     if log_decisions:
         _log_cluster_reasons(paths, groups, GR,
@@ -416,13 +449,16 @@ def process_folder(folder, out_dir, args):
     print(f"  [2/3] clustering {len(paths)} image(s) ({pairs} pairs) "
           f"(combined>= {args.sim_threshold}, weights h/g/e/c = "
           f"{args.w_hash}/{args.w_gray}/{args.w_edge}/{args.w_color}, "
-          f"or struct>= {args.strong_gray_threshold}) ...")
+          f"or struct>= {args.strong_gray_threshold}, "
+          f"rescue singles>= {args.singleton_threshold}) ...")
     t2 = time.time()
     groups, GR = build_groups(paths, bits_list, gray_list, edge_list, col_list,
                               args.w_hash, args.w_gray, args.w_edge,
                               args.w_color, args.sim_threshold,
                               args.strong_gray_threshold, progress=True,
-                              log_decisions=True)
+                              log_decisions=True,
+                              singleton_threshold=args.singleton_threshold,
+                              rescue_singletons=args.rescue_singletons)
     print(f"  [2/3] done in {time.time() - t2:.1f}s "
           f"({len(groups)} raw cluster(s))")
     log.info("[2/3] clustered %d image(s) into %d raw cluster(s) in %.1fs",
@@ -599,6 +635,18 @@ def build_parser():
                    help="min grayscale structure correlation to group two "
                         "photos on its own, even if the combined score is low "
                         "(default 0.80)")
+    p.add_argument("--singleton-threshold", type=float, default=0.50,
+                   help="in the singleton-rescue pass, min COMBINED similarity "
+                        "to pair up leftover singletons (default 0.50; keep it "
+                        "at or below --sim-threshold)")
+    p.add_argument("--rescue-singletons", dest="rescue_singletons",
+                   action="store_true", default=True,
+                   help="after grouping, re-cluster leftover singletons at "
+                        "--singleton-threshold so near-matches aren't stranded "
+                        "(default: on)")
+    p.add_argument("--no-rescue-singletons", dest="rescue_singletons",
+                   action="store_false",
+                   help="disable the singleton-rescue pass")
     p.add_argument("--grid", type=int, default=16,
                    help="colour correlation grid size, grid x grid (default 16)")
     p.add_argument("--struct-grid", type=int, default=48,
@@ -629,10 +677,12 @@ def main():
     log.info("root=%s  out_name=%s  python=%s", os.path.abspath(root),
              args.out_name, sys.version.split()[0])
     log.info("settings: hash_size=%d sim>=%.2f weights h/g/e/c="
-             "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f grid=%d struct_grid=%d "
-             "min_group_size=%d singletons=%s",
+             "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f rescue_singles=%s "
+             "singleton>=%.2f grid=%d struct_grid=%d min_group_size=%d "
+             "singletons=%s",
              args.hash_size, args.sim_threshold, args.w_hash, args.w_gray,
-             args.w_edge, args.w_color, args.strong_gray_threshold, args.grid,
+             args.w_edge, args.w_color, args.strong_gray_threshold,
+             args.rescue_singletons, args.singleton_threshold, args.grid,
              args.struct_grid, args.min_group_size, args.singletons)
     log.info("image folders found (%d):", len(folders))
     for f in folders:
