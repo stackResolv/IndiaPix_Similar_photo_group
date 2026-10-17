@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-group_similar.py — group visually similar photos (bursts / repeated takes) into
-folders, the way a photoshoot produces many near-identical frames of the same
-shot (a model standing or smiling clicked several times).
+group_similar.py — distribute photos so that SIMILAR ones end up in DIFFERENT
+folders.  Every output folder then holds only photos that are visibly DISTINCT
+from one another (no two near-duplicates in the same folder).
 
-Given a folder of photos, this finds groups of near-duplicate / same-scene
-photos and copies each group into its own sub-folder, plus a CSV/XLSX report.
-The source files are never moved, renamed or modified — they are only copied.
+This is the inverse of "collect each burst of repeated takes into one folder".
+A photoshoot shoots a model standing / smiling / sitting again and again, so most
+frames have near-twins.  Here those near-twins are SPREAD APART: similar photos
+are forced into separate folders, and the unique shots are used as filler to keep
+the folders evenly sized.
+
+The effect is that the number of folders is driven UP by how many near-identical
+takes exist: if some pose was shot 6 times, you get at least 6 folders so all 6
+copies land in different places.
 
 Similarity is measured 100% locally (no cloud, no cost, no API key) using a
 blend of FOUR complementary, content-aware signals:
@@ -14,30 +20,36 @@ blend of FOUR complementary, content-aware signals:
   1. pHash (perceptual hash) ......... coarse, rotation-normalised, cheap.
   2. Grayscale STRUCTURE correlation . the dominant signal: the whole frame is
                                        downscaled and contrast-normalised, so
-                                       COMPOSITION is compared directly.  An
-                                       extra person, a missing prop or a
-                                       different crop changes the structure and
-                                       lowers this score — exactly the "same
-                                       scene but not the same shot" case.
+                                       COMPOSITION is compared directly.
   3. Edge correlation ................ captures outlines / object boundaries.
   4. Colour correlation on a grid .... colour-aware detail (backdrop, outfit).
 
-Two photos join the same group when EITHER:
+Two photos are treated as "alike" (and therefore MUST NOT share a folder) when
+EITHER:
   * their COMBINED similarity — a weighted blend of the four measures above,
     weighted by --w-hash / --w-gray / --w-edge / --w-color — is
-    >= --sim-threshold (default 0.55),  -- or
+    >= --similar-threshold (default 0.60),  -- or
   * their grayscale structure correlation alone is
     >= --strong-gray-threshold (default 0.80) (near-identical composition).
 
-Blending the measures (instead of AND-ing hard cutoffs) avoids the old
-"AND-gate" failure where a genuine same-shot pair was split because one coarse
-measure was a hair too far even though the others agreed.
+These "alike" pairs form a CONFLICT GRAPH.  The folders are the colours of that
+graph, found with DSATUR colouring so two alike photos never share a colour:
 
-Groups are built with AVERAGE-LINKAGE (UPGMA) agglomerative clustering: two
-clusters merge only while the AVERAGE similarity between their members is high
-enough.  This is what prevents "chaining" — a frame similar to just ONE member
-of a group no longer drags a run of loosely-related frames together; such fringe
-frames drop out as singletons.
+    build conflict graph  ->  DSATUR colouring  ->  (optional) balanced fill
+
+DSATUR uses roughly the minimum number of colours, and that minimum equals the
+size of the largest set of mutually-alike photos — so a 6-take burst guarantees
+6 folders.  By default every NON-alike ("unique") photo is simply allowed to
+pool together, so you get one folder holding all the genuinely distinct shots
+plus one folder per take of each repeated pose.  If you would rather spread the
+unique photos evenly so the folders end up a similar size, pass --balance (off
+by default).
+
+Why structure dominates the blend: on a studio shoot every frame shares the
+backdrop and lighting, so pHash and colour barely discriminate (a same-backdrop
+pair already scores ~0.5 identical-ness on those alone) — weighting them heavily
+would mark DIFFERENT poses as alike.  The grayscale structure signal is the one
+that actually tracks composition, hence its high default weight.
 
 Usage:
   # just give a folder path: every folder under it that holds images gets its
@@ -47,8 +59,8 @@ Usage:
   # or point at one shoot folder
   python3 group_similar.py "input_folder/Paltu/Edit"
 
-Tuning (lower --sim-threshold to group more aggressively; raise it to be
-stricter).
+Tuning (lower --similar-threshold to force MORE separation / more folders; raise
+it to tolerate more similarity within a folder / fewer folders).
 """
 
 import argparse
@@ -91,8 +103,8 @@ PALETTE = ["D9E1F2", "FCE4D6", "E2EFDA", "FFF2CC", "EDEDED",
            "DDEBF7", "FDE9D9", "E4DFEC", "DCE6F1", "F2DCDB"]
 
 # Module logger.  Console progress is still printed directly; the log file
-# records the full story: what was scanned, which photos matched, and WHY (or
-# why a photo ended up a singleton).
+# records the full story: what was scanned, which photos conflict (must be
+# separated), and how the folders were balanced.
 log = logging.getLogger("group_similar")
 
 
@@ -207,7 +219,7 @@ def find_image_folders(root, out_name):
 
     Traversal skips our own output folders (the `out_name` directory and the
     `group_*` / `_singletons` folders inside it) so a second run does not try to
-    re-group the copies it produced the first time.
+    re-separate the copies it produced the first time.
     """
     folders = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -221,100 +233,22 @@ def find_image_folders(root, out_name):
 
 
 # --------------------------------------------------------------------------- #
-# Grouping core
+# Separation core: conflict graph -> colouring -> balancing
 # --------------------------------------------------------------------------- #
-def _weights(args):
-    return (args.w_hash, args.w_gray, args.w_edge, args.w_color)
+def build_conflict(paths, bits_list, gray_list, edge_list, col_list,
+                   w_hash, w_gray, w_edge, w_color,
+                   sim_threshold, strong_gray_threshold,
+                   chunk=256, progress=False):
+    """Build the pairwise similarity matrices and the conflict graph.
 
+    Returns (conflict, S, Gs):
+      * conflict — bool (n x n): True where two photos are "alike" and therefore
+                   MUST NOT share a folder.
+      * S        — float32 (n x n): combined similarity (weighted blend).
+      * Gs       — float32 (n x n): grayscale structure correlation.
 
-def _log_cluster_reasons(paths, groups, GR, args):
-    """Write a human-readable "why" for every group and every singleton."""
-    d = GR.shape[1]
-    multi = sorted((g for g in groups if len(g) > 1), key=len, reverse=True)
-    singles = [g[0] for g in groups if len(g) == 1]
-
-    log.info("cluster summary: %d multi-photo group(s), %d singleton(s)",
-             len(multi), len(singles))
-    for rank, members in enumerate(multi, 1):
-        names = ", ".join(os.path.basename(paths[i]) for i in members)
-        log.info("GROUP %02d  size=%d  members: %s", rank, len(members), names)
-
-    for i in singles:
-        sims = (GR @ GR[i]) / d
-        sims[i] = -2.0
-        j = int(np.argmax(sims))
-        c = float(sims[j])
-        misses = []
-        if c < args.strong_gray_threshold:
-            misses.append(f"structure corr {c:.3f} < "
-                          f"{args.strong_gray_threshold} (strong)")
-        log.debug("SINGLE  %s  | closest %s: structure corr %.3f "
-                  "-> not grouped because %s",
-                  os.path.basename(paths[i]), os.path.basename(paths[j]),
-                  c, "; ".join(misses) or "no qualifying partner")
-
-
-def _average_linkage(S, Gs, ids, thr, strong_thr):
-    """Average-linkage (UPGMA) over the subset `ids`.
-
-    Two clusters merge while their AVERAGE combined similarity (matrix `S`) is
-    >= `thr`, or their average structure correlation (matrix `Gs`) is
-    >= `strong_thr`.  Returns a list of index-lists (global indices).
-    """
-    ids = list(ids)
-    m = len(ids)
-    if m <= 1:
-        return [ids]
-    Sc = S[np.ix_(ids, ids)].astype(np.float64).copy()
-    Gc = Gs[np.ix_(ids, ids)].astype(np.float64).copy()
-    size = np.ones(m, dtype=np.float64)
-    active = np.ones(m, dtype=bool)
-    members = [[k] for k in range(m)]
-    while True:
-        M = np.where(active[:, None] & active[None, :], Sc, -np.inf)
-        np.fill_diagonal(M, -np.inf)
-        Q = np.where(active[:, None] & active[None, :], Gc, -np.inf)
-        np.fill_diagonal(Q, -np.inf)
-        valid = (M >= thr) | (Q >= strong_thr)
-        score = np.where(valid, np.maximum(M, Q), -np.inf)
-        k = int(np.argmax(score))
-        a, b = divmod(k, m)
-        if not np.isfinite(score[a, b]):
-            break
-        na, nb = size[a], size[b]
-        Sc[a, :] = (na * Sc[a, :] + nb * Sc[b, :]) / (na + nb)
-        Sc[:, a] = Sc[a, :]
-        Gc[a, :] = (na * Gc[a, :] + nb * Gc[b, :]) / (na + nb)
-        Gc[:, a] = Gc[a, :]
-        size[a] = na + nb
-        members[a] = members[a] + members[b]
-        active[b] = False
-    return [[ids[k] for k in members[c]] for c in range(m) if active[c]]
-
-
-def build_groups(paths, bits_list, gray_list, edge_list, col_list,
-                 w_hash=0.3, w_gray=0.4, w_edge=0.1, w_color=0.2,
-                 sim_threshold=0.55, strong_gray_thresh=0.80,
-                 singleton_threshold=0.50, rescue_singletons=True, chunk=256,
-                 progress=False, log_decisions=False):
-    """Average-linkage (UPGMA) agglomerative clustering of the "similar" relation.
-
-    Unlike single-linkage union-find — which merges two clusters as soon as the
-    single closest pair crosses the threshold — average linkage merges only
-    while the AVERAGE similarity between the two clusters' members is high
-    enough.  That is what stops "chaining": a frame that is similar to just ONE
-    member of a group (an intermediate pose) no longer drags a whole run of
-    loosely-related frames into the same folder.  Such fringe frames fall out as
-    singletons instead.
-
-    The merge score is the COMBINED similarity (weighted blend of pHash,
-    grayscale structure, edge and colour); two clusters are also merged when
-    their average grayscale structure correlation alone is very high
-    (`strong_gray_thresh`), which keeps near-identical frames together even when
-    the combined blend dips.
-
-    Returns (groups, GR) where groups is a list of index lists and GR is the
-    (n x d) matrix of normalised grayscale vectors (used again for reporting).
+    A pair conflicts when its combined similarity >= `sim_threshold` OR its
+    structure correlation >= `strong_gray_threshold`.
     """
     n = len(paths)
     H = np.stack(bits_list).astype(np.int32)     # n x bits (0/1)
@@ -328,9 +262,9 @@ def build_groups(paths, bits_list, gray_list, edge_list, col_list,
     notH = (1 - H).T        # bits x n
     Ht = H.T                # bits x n
 
-    # Full pairwise matrices (float32): combined similarity and structure corr.
     S = np.empty((n, n), dtype=np.float32)
     Gs = np.empty((n, n), dtype=np.float32)
+    conflict = np.zeros((n, n), dtype=bool)
     t0 = time.time()
     for i0 in range(0, n, chunk):
         i1 = min(n, i0 + chunk)
@@ -343,6 +277,8 @@ def build_groups(paths, bits_list, gray_list, edge_list, col_list,
         Cc = (CO[i0:i1] @ CO.T) / dc
         S[i0:i1] = w_hash * hash_sim + w_gray * Cg + w_edge * Ce + w_color * Cc
         Gs[i0:i1] = Cg
+        conflict[i0:i1] = ((S[i0:i1] >= sim_threshold)
+                           | (Gs[i0:i1] >= strong_gray_threshold))
         if progress and (i1 % (chunk * 8) == 0 or i1 == n):
             pct = 100 * i1 / n
             rate = i1 / max(time.time() - t0, 1e-6)
@@ -350,53 +286,124 @@ def build_groups(paths, bits_list, gray_list, edge_list, col_list,
             print(f"    compared {i1}/{n} ({pct:.0f}%), ~{eta:.0f}s left")
     np.fill_diagonal(S, 1.0)
     np.fill_diagonal(Gs, 1.0)
-
-    # Main pass: average-linkage (UPGMA) over every photo.
-    groups = _average_linkage(S, Gs, range(n), sim_threshold,
-                              strong_gray_thresh)
-
-    # Rescue pass: re-cluster ONLY the leftover singletons at a slightly looser
-    # threshold, so a genuine near-match that just missed the main cut is not
-    # stranded alone.  It runs on the singleton subset only, so it never loosens
-    # the main groups — and therefore never re-introduces over-merging.
-    if rescue_singletons:
-        singles = [g[0] for g in groups if len(g) == 1]
-        if len(singles) > 1:
-            rescued = _average_linkage(S, Gs, singles, singleton_threshold,
-                                       strong_gray_thresh)
-            kept_multi = [g for g in groups if len(g) > 1]
-            rescued_multi = [g for g in rescued if len(g) > 1]
-            still_single = [[g[0]] for g in rescued if len(g) == 1]
-            if log_decisions and rescued_multi:
-                for g in rescued_multi:
-                    pairs = [(float(S[g[x], g[y]]), g[x], g[y])
-                             for x in range(len(g)) for y in range(x + 1, len(g))]
-                    pairs.sort(reverse=True)
-                    best = pairs[0]
-                    log.debug("RESCUE -> group of %d (best pair %s <-> %s "
-                              "combined %.3f)", len(g),
-                              os.path.basename(paths[best[1]]),
-                              os.path.basename(paths[best[2]]), best[0])
-            log.info("rescue pass: %d singleton(s) -> %d new group(s), %d still "
-                     "alone (threshold %.2f)", len(singles), len(rescued_multi),
-                     len(still_single), singleton_threshold)
-            groups = kept_multi + rescued_multi + still_single
-
-    if log_decisions:
-        _log_cluster_reasons(paths, groups, GR,
-                             argparse.Namespace(strong_gray_threshold=
-                                                strong_gray_thresh))
-    return groups, GR
+    np.fill_diagonal(conflict, False)
+    return conflict, S, Gs
 
 
-def pick_representative(members, GR):
-    """Return the medoid index: the member most similar to all the others."""
-    if len(members) == 1:
-        return members[0]
-    sub = GR[members]                             # m x d
-    sims = (sub @ sub.T) / sub.shape[1]           # m x m correlations
-    np.fill_diagonal(sims, -2.0)
-    return members[int(np.argmax(sims.mean(axis=1)))]
+def dsatur_colour(conflict):
+    """DSATUR graph colouring of the conflict graph.
+
+    Each vertex (photo) gets the smallest colour not used by its neighbours
+    (its conflicting "alike" photos).  Vertices are chosen in order of
+    DECREASING saturation (number of distinct colours among neighbours), which
+    keeps the colour count close to the minimum.  Returns a list of colour
+    classes, each a list of vertex indices.
+    """
+    n = conflict.shape[0]
+    if n == 0:
+        return []
+    colors = [-1] * n
+    neighbour_colors = [set() for _ in range(n)]
+    degrees = conflict.sum(axis=1)
+    uncoloured = set(range(n))
+    while uncoloured:
+        best = None
+        best_key = None
+        for v in uncoloured:
+            key = (len(neighbour_colors[v]), degrees[v], -v)
+            if best_key is None or key > best_key:
+                best_key = key
+                best = v
+        v = best
+        used = neighbour_colors[v]
+        c = 0
+        while c in used:
+            c += 1
+        colors[v] = c
+        uncoloured.discard(v)
+        for u in np.nonzero(conflict[v])[0]:
+            u = int(u)
+            if colors[u] == -1:
+                neighbour_colors[u].add(c)
+    k = max(colors) + 1
+    groups = [[] for _ in range(k)]
+    for v, c in enumerate(colors):
+        groups[c].append(v)
+    return [g for g in groups if g]
+
+
+def balance_groups(groups, conflict):
+    """Even out folder sizes without ever breaking the no-alike-pair rule.
+
+    Repeatedly move a photo from the largest folder to the smallest folder that
+    contains NO conflicting (alike) photo.  Every move reduces the spread, so
+    this terminates.  Returns the (possibly reordered) group list.
+    """
+    groups = [list(g) for g in groups]
+    k = len(groups)
+    if k <= 1:
+        return groups
+    while True:
+        order = sorted(range(k), key=lambda i: len(groups[i]))
+        largest = order[-1]
+        smallest = order[0]
+        if len(groups[largest]) - len(groups[smallest]) <= 1:
+            break
+        moved = False
+        # Prefer the truly smallest folder; fall back to any folder that is
+        # still meaningfully smaller than the largest.
+        for cand in order:
+            if cand == largest:
+                continue
+            if len(groups[largest]) - len(groups[cand]) <= 1:
+                continue
+            for idx in list(groups[largest]):
+                clash = conflict[idx]
+                if any(clash[other] for other in groups[cand]):
+                    continue
+                groups[largest].remove(idx)
+                groups[cand].append(idx)
+                moved = True
+                break
+            if moved:
+                break
+        if not moved:
+            break
+    return groups
+
+
+def separate_groups(paths, bits_list, gray_list, edge_list, col_list,
+                    w_hash, w_gray, w_edge, w_color,
+                    sim_threshold, strong_gray_threshold,
+                    chunk=256, progress=False, balance=False):
+    """Full pipeline: conflict graph -> DSATUR colouring -> (optional) balance.
+
+    Returns (groups, S, Gs) where `groups` is a list of index lists (one per
+    folder) and `S`/`Gs` are the pairwise matrices used for reporting.
+
+    By default the unique (non-conflicting) photos are left pooled together, so
+    folders are as FEW and as PURE as possible.  Pass `balance=True` to spread
+    them out so the folders end up similar in size.
+    """
+    conflict, S, Gs = build_conflict(
+        paths, bits_list, gray_list, edge_list, col_list,
+        w_hash, w_gray, w_edge, w_color, sim_threshold, strong_gray_threshold,
+        chunk=chunk, progress=progress)
+    groups = dsatur_colour(conflict)
+    if balance:
+        groups = balance_groups(groups, conflict)
+    return groups, S, Gs
+
+
+def _log_decisions(paths, groups, S, Gs, sim_threshold, strong_gray_threshold):
+    """Write a human-readable reason per folder and per forced-apart pair."""
+    n_conflicts = int(np.count_nonzero(np.triu(S >= sim_threshold, 1))
+                      + np.count_nonzero(np.triu(Gs >= strong_gray_threshold, 1)))
+    log.info("separation summary: %d folder(s) from %d forced-apart pair(s)",
+             len(groups), n_conflicts)
+    for rank, members in enumerate(sorted(groups, key=len, reverse=True), 1):
+        names = ", ".join(os.path.basename(paths[i]) for i in sorted(members))
+        log.info("FOLDER %02d  size=%d  members: %s", rank, len(members), names)
 
 
 # --------------------------------------------------------------------------- #
@@ -444,25 +451,24 @@ def process_folder(folder, out_dir, args):
     print(f"  [1/3] done in {time.time() - t1:.1f}s "
           f"({len(paths)} fingerprint(s))")
 
-    # ---- Phase 2: cluster -------------------------------------------------- #
+    # ---- Phase 2: build conflict graph, colour, balance -------------------- #
     pairs = len(paths) * (len(paths) - 1) // 2
-    print(f"  [2/3] clustering {len(paths)} image(s) ({pairs} pairs) "
-          f"(combined>= {args.sim_threshold}, weights h/g/e/c = "
-          f"{args.w_hash}/{args.w_gray}/{args.w_edge}/{args.w_color}, "
-          f"or struct>= {args.strong_gray_threshold}, "
-          f"rescue singles>= {args.singleton_threshold}) ...")
+    print(f"  [2/3] separating {len(paths)} image(s) ({pairs} pairs) "
+          f"(alike if combined>= {args.similar_threshold} with weights "
+          f"h/g/e/c = {args.w_hash}/{args.w_gray}/{args.w_edge}/{args.w_color}, "
+          f"or struct>= {args.strong_gray_threshold}) ...")
     t2 = time.time()
-    groups, GR = build_groups(paths, bits_list, gray_list, edge_list, col_list,
-                              args.w_hash, args.w_gray, args.w_edge,
-                              args.w_color, args.sim_threshold,
-                              args.strong_gray_threshold, progress=True,
-                              log_decisions=True,
-                              singleton_threshold=args.singleton_threshold,
-                              rescue_singletons=args.rescue_singletons)
+    groups, S, Gs = separate_groups(
+        paths, bits_list, gray_list, edge_list, col_list,
+        args.w_hash, args.w_gray, args.w_edge, args.w_color,
+        args.similar_threshold, args.strong_gray_threshold,
+        progress=True, balance=args.balance)
     print(f"  [2/3] done in {time.time() - t2:.1f}s "
-          f"({len(groups)} raw cluster(s))")
-    log.info("[2/3] clustered %d image(s) into %d raw cluster(s) in %.1fs",
+          f"({len(groups)} folder(s))")
+    log.info("[2/3] separated %d image(s) into %d folder(s) in %.1fs",
              len(paths), len(groups), time.time() - t2)
+    _log_decisions(paths, groups, S, Gs, args.similar_threshold,
+                   args.strong_gray_threshold)
 
     # capture-time cache (used for ordering + report)
     ctime = {}
@@ -472,7 +478,7 @@ def process_folder(folder, out_dir, args):
             ctime[i] = read_capture_time(paths[i]) or ""
         return ctime[i]
 
-    # Order: biggest groups first, then earliest capture time, then name.
+    # Order folders: biggest first, then earliest capture time, then name.
     def gkey(members):
         times = [ct(i) or "~" for i in members]
         names = sorted(os.path.basename(paths[i]) for i in members)
@@ -498,46 +504,35 @@ def process_folder(folder, out_dir, args):
         dest = os.path.join(dest_dir, base)
         shutil.copy2(src, dest)
 
-    print(f"  [3/3] writing {len(groups)} cluster(s) to '{out_dir}' ...")
-    rows = []          # (group_id, file, group_size, similarity, capture_time)
+    print(f"  [3/3] writing {len(groups)} folder(s) to '{out_dir}' ...")
+    rows = []          # (group_id, file, group_size, max_similarity, capture_time)
     n_groups = 0
-    n_singletons = 0
-    group_index = 0
+    sizes = []
 
     for members in groups:
         size = len(members)
-        rep = pick_representative(members, GR)
-        is_single = size < args.min_group_size
-
-        if is_single:
-            n_singletons += 1
-            if args.singletons == "skip":
-                continue
-            if args.singletons == "separate":
-                gid = "_singletons"
-                dest_dir = os.path.join(out_dir, "_singletons")
-            else:  # "group": give each singleton its own numbered folder
-                group_index += 1
-                n_groups += 1
-                gid = f"{group_index:04d}"
-                dest_dir = os.path.join(out_dir, f"group_{gid}")
-        else:
-            group_index += 1
-            n_groups += 1
-            gid = f"{group_index:04d}"
-            dest_dir = os.path.join(out_dir, f"group_{gid}")
-
+        n_groups += 1
+        gid = f"{n_groups:04d}"
+        dest_dir = os.path.join(out_dir, f"group_{gid}")
+        sizes.append(size)
+        # order within the folder by capture time, then name
+        ordered = sorted(members, key=lambda i: (ct(i) or "~",
+                                                 os.path.basename(paths[i])))
         for m in members:
-            sim = 1.0 if m == rep else float((GR[m] @ GR[rep]) / GR.shape[1])
-            place(paths[m], dest_dir)
+            if size > 1:
+                best = max(float(S[m, o]) for o in members if o != m)
+            else:
+                best = 0.0
             rows.append((gid, os.path.basename(paths[m]), size,
-                         round(sim, 3), ct(m)))
+                         round(best, 3), ct(m)))
+        for m in ordered:
+            place(paths[m], dest_dir)
 
     # ---- CSV report ------------------------------------------------------ #
     csv_path = os.path.join(out_dir, "groups.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["group_id", "file", "group_size", "similarity",
+        w.writerow(["group_id", "file", "group_size", "max_similarity",
                     "capture_time"])
         w.writerows(rows)
 
@@ -546,7 +541,8 @@ def process_folder(folder, out_dir, args):
     wb = Workbook()
     ws = wb.active
     ws.title = "Groups"
-    headers = ["group_id", "file", "group_size", "similarity", "capture_time"]
+    headers = ["group_id", "file", "group_size", "max_similarity",
+               "capture_time"]
     ws.append(headers)
     for c in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=c)
@@ -557,42 +553,37 @@ def process_folder(folder, out_dir, args):
     color_for = {}
     for gid, fname, size, sim, ctv in rows:
         if gid not in color_for:
-            if gid == "_singletons":
-                color_for[gid] = "FFF2CC"
-            else:
-                try:
-                    idx = int(gid) - 1
-                except ValueError:
-                    idx = 0
-                color_for[gid] = PALETTE[idx % len(PALETTE)]
+            try:
+                idx = int(gid) - 1
+            except ValueError:
+                idx = 0
+            color_for[gid] = PALETTE[idx % len(PALETTE)]
         ws.append([gid, fname, size, sim, ctv])
         fill = color_for[gid]
         ws.cell(row=ws.max_row, column=1).fill = PatternFill("solid",
                                                              fgColor=fill)
 
-    for i, w in enumerate([14, 34, 12, 12, 22], 1):
+    for i, w in enumerate([14, 34, 12, 14, 22], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
     wb.save(xlsx_path)
 
-    multi = [m for m in groups if len(m) >= args.min_group_size]
-    largest = max((len(m) for m in multi), default=0)
-    print(f"  groups (>= {args.min_group_size}) : {n_groups}  "
-          f"(largest: {largest})")
-    print(f"  singletons       : {n_singletons}  (mode: {args.singletons})")
+    largest = max(sizes, default=0)
+    smallest = min(sizes, default=0)
+    print(f"  folders          : {n_groups}  "
+          f"(largest: {largest}, smallest: {smallest})")
     print(f"  output           : {out_dir}")
     print(f"  report           : {csv_path}")
     print(f"  done in {time.time() - t0:.1f}s")
-    log.info("[3/3] wrote %d group(s) + %d singleton(s) to %s",
-             n_groups, n_singletons, out_dir)
+    log.info("[3/3] wrote %d folder(s) to %s", n_groups, out_dir)
 
     return {
         "folder": folder,
         "out": out_dir,
         "images": len(paths),
         "groups": n_groups,
-        "singletons": n_singletons,
         "largest": largest,
+        "smallest": smallest,
         "csv": csv_path,
     }
 
@@ -602,63 +593,54 @@ def process_folder(folder, out_dir, args):
 # --------------------------------------------------------------------------- #
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Group visually similar photos (bursts / repeated takes) "
-                    "into folders. Give one folder path; every folder under it "
-                    "that holds images gets its own group folders, created "
-                    "inside it. Local, free, non-destructive.",
+        description="Distribute photos so SIMILAR ones land in DIFFERENT "
+                    "folders: every output folder ends up holding only "
+                    "visibly distinct photos. Give one folder path; every "
+                    "folder under it that holds images gets its own group "
+                    "folders, created inside it. Local, free, non-destructive.",
     )
     p.add_argument("path",
                    help="folder to scan; every nested folder holding images is "
-                        "grouped, with a '<out-name>/' folder created inside it")
+                        "separated, with a '<out-name>/' folder created inside "
+                        "it")
     p.add_argument("--out-name", default=DEFAULT_OUT_NAME,
                    help="name of the group folder created inside each image "
                         f"folder (default: {DEFAULT_OUT_NAME})")
     p.add_argument("--hash-size", type=int, default=8,
                    help="pHash bits per side (default 8 -> 64-bit hash)")
-    p.add_argument("--sim-threshold", type=float, default=0.55,
+    p.add_argument("--similar-threshold", type=float, default=0.60,
                    help="min COMBINED similarity (weighted blend of pHash, "
-                        "structure, edge and colour) to group two photos; "
-                        "lower = group more (default 0.55)")
-    p.add_argument("--w-hash", type=float, default=0.3,
-                   help="weight of pHash similarity in the combined score "
-                        "(default 0.3)")
-    p.add_argument("--w-gray", type=float, default=0.4,
-                   help="weight of grayscale STRUCTURE correlation (the main "
-                        "signal) in the combined score (default 0.4)")
+                        "structure, edge and colour) at which two photos are "
+                        "treated as alike and forced into DIFFERENT folders; "
+                        "lower = more separation / more folders (default 0.60)")
+    p.add_argument("--w-hash", type=float, default=0.15,
+                   help="weight of pHash similarity in the combined score. "
+                        "Keep this LOW: on a same-backdrop shoot pHash barely "
+                        "discriminates and would falsely merge different poses "
+                        "(default 0.15)")
+    p.add_argument("--w-gray", type=float, default=0.6,
+                   help="weight of grayscale STRUCTURE correlation — the main "
+                        "signal that tracks composition (default 0.6)")
     p.add_argument("--w-edge", type=float, default=0.1,
                    help="weight of edge/outline correlation in the combined "
                         "score (default 0.1)")
-    p.add_argument("--w-color", type=float, default=0.2,
-                   help="weight of colour correlation in the combined score "
-                        "(default 0.2)")
+    p.add_argument("--w-color", type=float, default=0.15,
+                   help="weight of colour correlation in the combined score. "
+                        "Keep this LOW: a shared backdrop gives a high colour "
+                        "score even for different poses (default 0.15)")
     p.add_argument("--strong-gray-threshold", type=float, default=0.80,
-                   help="min grayscale structure correlation to group two "
-                        "photos on its own, even if the combined score is low "
-                        "(default 0.80)")
-    p.add_argument("--singleton-threshold", type=float, default=0.50,
-                   help="in the singleton-rescue pass, min COMBINED similarity "
-                        "to pair up leftover singletons (default 0.50; keep it "
-                        "at or below --sim-threshold)")
-    p.add_argument("--rescue-singletons", dest="rescue_singletons",
-                   action="store_true", default=True,
-                   help="after grouping, re-cluster leftover singletons at "
-                        "--singleton-threshold so near-matches aren't stranded "
-                        "(default: on)")
-    p.add_argument("--no-rescue-singletons", dest="rescue_singletons",
-                   action="store_false",
-                   help="disable the singleton-rescue pass")
+                   help="min grayscale structure correlation at which two "
+                        "photos are alike on its own (forced apart) even if the "
+                        "combined score is low (default 0.80)")
     p.add_argument("--grid", type=int, default=16,
                    help="colour correlation grid size, grid x grid (default 16)")
     p.add_argument("--struct-grid", type=int, default=48,
                    help="grayscale structure grid size, grid x grid "
                         "(default 48)")
-    p.add_argument("--min-group-size", type=int, default=2,
-                   help="a group must have at least this many photos "
-                        "(default 2)")
-    p.add_argument("--singletons", default="separate",
-                   choices=["separate", "group", "skip"],
-                   help="what to do with photos that have no similar partner "
-                        "(default: separate)")
+    p.add_argument("--balance", action="store_true", default=False,
+                   help="spread the unique photos evenly so all folders end up "
+                        "a similar size; off by default, which pools unique "
+                        "photos together and keeps the folder count minimal")
     return p
 
 
@@ -676,14 +658,12 @@ def main():
     log.info("=== group_similar run start ===")
     log.info("root=%s  out_name=%s  python=%s", os.path.abspath(root),
              args.out_name, sys.version.split()[0])
-    log.info("settings: hash_size=%d sim>=%.2f weights h/g/e/c="
-             "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f rescue_singles=%s "
-             "singleton>=%.2f grid=%d struct_grid=%d min_group_size=%d "
-             "singletons=%s",
-             args.hash_size, args.sim_threshold, args.w_hash, args.w_gray,
-             args.w_edge, args.w_color, args.strong_gray_threshold,
-             args.rescue_singletons, args.singleton_threshold, args.grid,
-             args.struct_grid, args.min_group_size, args.singletons)
+    log.info("settings: hash_size=%d alike_if_combined>=%.2f weights h/g/e/c="
+             "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f grid=%d struct_grid=%d "
+             "balance=%s",
+             args.hash_size, args.similar_threshold, args.w_hash, args.w_gray,
+             args.w_edge, args.w_color, args.strong_gray_threshold, args.grid,
+             args.struct_grid, args.balance)
     log.info("image folders found (%d):", len(folders))
     for f in folders:
         log.info("  - %s", os.path.relpath(f, root))
@@ -715,12 +695,10 @@ def main():
     print("\n=== Done ===")
     tot_images = sum(s["images"] for s in summaries)
     tot_groups = sum(s["groups"] for s in summaries)
-    tot_single = sum(s["singletons"] for s in summaries)
-    log.info("=== run done: %d image(s) -> %d group(s), %d singleton(s) "
-             "across %d folder(s) ===",
-             tot_images, tot_groups, tot_single, len(summaries))
-    print(f"{tot_images} image(s) -> {tot_groups} group(s), "
-          f"{tot_single} singleton(s) across {len(summaries)} folder(s).")
+    log.info("=== run done: %d image(s) -> %d folder(s) across %d folder(s) ===",
+             tot_images, tot_groups, len(summaries))
+    print(f"{tot_images} image(s) -> {tot_groups} folder(s) "
+          f"across {len(summaries)} folder(s).")
 
 
 if __name__ == "__main__":
