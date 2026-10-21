@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-group_similar.py — distribute photos so that SIMILAR ones end up in DIFFERENT
-folders.  Every output folder then holds only photos that are visibly DISTINCT
-from one another (no two near-duplicates in the same folder).
+group_similar.py — split a folder of photos into exactly TWO output folders:
 
-This is the inverse of "collect each burst of repeated takes into one folder".
-A photoshoot shoots a model standing / smiling / sitting again and again, so most
-frames have near-twins.  Here those near-twins are SPREAD APART: similar photos
-are forced into separate folders, and the unique shots are used as filler to keep
-the folders evenly sized.
+  distinct/    ONE representative of every look-alike (burst) group, plus every
+               photo that has no look-alike at all.  Nothing in here is a near
+               duplicate of anything else in here.
+  duplicates/  every extra take — the near-twins of the representative that was
+               kept in distinct/.
 
-The effect is that the number of folders is driven UP by how many near-identical
-takes exist: if some pose was shot 6 times, you get at least 6 folders so all 6
-copies land in different places.
+So a folder of 10 photos in which "standing" was shot 3x, "smiling" 2x and the
+other 5 are unique becomes:
+
+  distinct/    standing #1, smiling #1, plus the 5 unique shots   (7 photos)
+  duplicates/  standing #2, standing #3, smiling #2               (3 photos)
+
+The representative of each look-alike group is its EARLIEST shot (by EXIF
+capture time, falling back to file name), so the kept frame is the first take;
+the later takes are the ones moved aside.
 
 Similarity is measured 100% locally (no cloud, no cost, no API key) using a
 blend of FOUR complementary, content-aware signals:
@@ -24,26 +28,17 @@ blend of FOUR complementary, content-aware signals:
   3. Edge correlation ................ captures outlines / object boundaries.
   4. Colour correlation on a grid .... colour-aware detail (backdrop, outfit).
 
-Two photos are treated as "alike" (and therefore MUST NOT share a folder) when
-EITHER:
+Two photos are treated as "alike" (near duplicates) when EITHER:
   * their COMBINED similarity — a weighted blend of the four measures above,
     weighted by --w-hash / --w-gray / --w-edge / --w-color — is
     >= --similar-threshold (default 0.60),  -- or
   * their grayscale structure correlation alone is
     >= --strong-gray-threshold (default 0.80) (near-identical composition).
 
-These "alike" pairs form a CONFLICT GRAPH.  The folders are the colours of that
-graph, found with DSATUR colouring so two alike photos never share a colour:
-
-    build conflict graph  ->  DSATUR colouring  ->  (optional) balanced fill
-
-DSATUR uses roughly the minimum number of colours, and that minimum equals the
-size of the largest set of mutually-alike photos — so a 6-take burst guarantees
-6 folders.  By default every NON-alike ("unique") photo is simply allowed to
-pool together, so you get one folder holding all the genuinely distinct shots
-plus one folder per take of each repeated pose.  If you would rather spread the
-unique photos evenly so the folders end up a similar size, pass --balance (off
-by default).
+These "alike" pairs link the photos into LOOK-ALIKE GROUPS (connected
+components): every group is one burst of repeated takes of the same shot.
+Exactly one member of each group is kept in distinct/, the rest go to
+duplicates/.
 
 Why structure dominates the blend: on a studio shoot every frame shares the
 backdrop and lighting, so pHash and colour barely discriminate (a same-backdrop
@@ -53,14 +48,14 @@ that actually tracks composition, hence its high default weight.
 
 Usage:
   # just give a folder path: every folder under it that holds images gets its
-  # own set of group folders, created INSIDE that folder (in "_groups/")
+  # own distinct/ + duplicates/ pair, created INSIDE that folder
   python3 group_similar.py "input_folder"
 
   # or point at one shoot folder
   python3 group_similar.py "input_folder/Paltu/Edit"
 
-Tuning (lower --similar-threshold to force MORE separation / more folders; raise
-it to tolerate more similarity within a folder / fewer folders).
+Tuning (lower --similar-threshold to treat more photos as duplicates; raise it
+to keep more of them in distinct/).
 """
 
 import argparse
@@ -92,19 +87,25 @@ except Exception:
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
 
 # Name of the per-folder output directory created inside each image folder.
-DEFAULT_OUT_NAME = "_groups"
+DEFAULT_OUT_NAME = "_separated"
+
+# The two output folders produced for every image folder.
+GROUP_DISTINCT = "distinct"       # one representative per look-alike group + uniques
+GROUP_DUPLICATES = "duplicates"   # all remaining extra takes
+
+# Colours used to tint the two folders in the Excel sheet
+GROUP_FILL = {
+    GROUP_DISTINCT: "E2EFDA",
+    GROUP_DUPLICATES: "FCE4D6",
+}
 
 # EXIF tag ids
 TAG_DATETIME = 306             # DateTime
 TAG_DATETIME_ORIGINAL = 36867  # DateTimeOriginal (capture time)
 
-# Colours used to tint each group in the Excel sheet
-PALETTE = ["D9E1F2", "FCE4D6", "E2EFDA", "FFF2CC", "EDEDED",
-           "DDEBF7", "FDE9D9", "E4DFEC", "DCE6F1", "F2DCDB"]
-
 # Module logger.  Console progress is still printed directly; the log file
-# records the full story: what was scanned, which photos conflict (must be
-# separated), and how the folders were balanced.
+# records the full story: what was scanned, which photos are look-alikes, which
+# one of each group was kept, and which takes were moved to duplicates/.
 log = logging.getLogger("group_similar")
 
 
@@ -148,26 +149,6 @@ def list_images(folder, recursive=False):
     return out
 
 
-def read_capture_time(path):
-    """Return the capture timestamp string (DateTimeOriginal) or None."""
-    try:
-        with Image.open(path) as im:
-            exif = im.getexif()
-            try:
-                ifd = exif.get_ifd(ExifTags.IFD.Exif)
-            except Exception:
-                ifd = {}
-            dto = ifd.get(TAG_DATETIME_ORIGINAL)
-            if dto:
-                return str(dto)
-            dt = exif.get(TAG_DATETIME)
-            if dt:
-                return str(dt)
-    except Exception:
-        return None
-    return None
-
-
 def _nz(a):
     """Flatten `a` and return it zero-mean / unit-std (a normalised vector)."""
     a = a.ravel()
@@ -175,9 +156,9 @@ def _nz(a):
 
 
 def features_of(path, hash_size, struct_grid, color_grid):
-    """Return (phash_bits, gray_vec, edge_vec, color_vec) for one image.
+    """Return (phash_bits, gray_vec, edge_vec, color_vec, capture_time).
 
-    Returns (None, None, None, None) on failure.
+    Returns (None, None, None, None, "") on failure.
 
     Orientation is normalised (EXIF transpose) so rotated copies still match.
     Every vector is zero-mean / unit-std so a plain normalised dot product IS
@@ -188,9 +169,22 @@ def features_of(path, hash_size, struct_grid, color_grid):
                   object, or a different crop, drops the score.
     * edge_vec  — gradient magnitude, emphasising outlines / object boundaries.
     * color_vec — downscaled RGB, colour-aware (backdrop / outfit differences).
+    * capture_time — EXIF DateTimeOriginal/DateTime as a string, or "".
     """
+    ctime = ""
     try:
         with Image.open(path) as im:
+            try:
+                exif = im.getexif()
+                try:
+                    ifd = exif.get_ifd(ExifTags.IFD.Exif)
+                except Exception:
+                    ifd = {}
+                dto = ifd.get(TAG_DATETIME_ORIGINAL) or exif.get(TAG_DATETIME)
+                if dto:
+                    ctime = str(dto)
+            except Exception:
+                pass
             im = ImageOps.exif_transpose(im)
             g = im.convert("L")
             ph = imagehash.phash(g, hash_size=hash_size)
@@ -205,10 +199,10 @@ def features_of(path, hash_size, struct_grid, color_grid):
         edge_v = _nz(edge)
         col_v = np.concatenate([_nz(col[:, :, c]) for c in range(3)])
         bits = np.asarray(ph.hash, dtype=np.int8).ravel()
-        return bits, gray_v, edge_v, col_v
+        return bits, gray_v, edge_v, col_v, ctime
     except Exception as e:
         log.warning("cannot read '%s': %s: %s", path, type(e).__name__, e)
-        return None, None, None, None
+        return None, None, None, None, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -217,9 +211,9 @@ def features_of(path, hash_size, struct_grid, color_grid):
 def find_image_folders(root, out_name):
     """Every folder under `root` that directly holds at least one image.
 
-    Traversal skips our own output folders (the `out_name` directory and the
-    `group_*` / `_singletons` folders inside it) so a second run does not try to
-    re-separate the copies it produced the first time.
+    Traversal skips our own output folders (the `out_name` directory, plus the
+    `group_*` / `_singletons` names left behind by older runs) so a second run
+    does not try to re-separate the copies it produced the first time.
     """
     folders = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -233,7 +227,7 @@ def find_image_folders(root, out_name):
 
 
 # --------------------------------------------------------------------------- #
-# Separation core: conflict graph -> colouring -> balancing
+# Similarity -> look-alike groups -> distinct / duplicates split
 # --------------------------------------------------------------------------- #
 def build_conflict(paths, bits_list, gray_list, edge_list, col_list,
                    w_hash, w_gray, w_edge, w_color,
@@ -243,7 +237,7 @@ def build_conflict(paths, bits_list, gray_list, edge_list, col_list,
 
     Returns (conflict, S, Gs):
       * conflict — bool (n x n): True where two photos are "alike" and therefore
-                   MUST NOT share a folder.
+                   are near duplicates.
       * S        — float32 (n x n): combined similarity (weighted blend).
       * Gs       — float32 (n x n): grayscale structure correlation.
 
@@ -290,120 +284,107 @@ def build_conflict(paths, bits_list, gray_list, edge_list, col_list,
     return conflict, S, Gs
 
 
-def dsatur_colour(conflict):
-    """DSATUR graph colouring of the conflict graph.
+def look_alike_groups(conflict):
+    """Connected components of the conflict graph (union-find).
 
-    Each vertex (photo) gets the smallest colour not used by its neighbours
-    (its conflicting "alike" photos).  Vertices are chosen in order of
-    DECREASING saturation (number of distinct colours among neighbours), which
-    keeps the colour count close to the minimum.  Returns a list of colour
-    classes, each a list of vertex indices.
+    Every returned component is one burst of repeated takes: all its photos are
+    linked (directly or transitively) by "alike" edges.  Photos with no
+    look-alike at all come back as components of size 1.
     """
     n = conflict.shape[0]
-    if n == 0:
-        return []
-    colors = [-1] * n
-    neighbour_colors = [set() for _ in range(n)]
-    degrees = conflict.sum(axis=1)
-    uncoloured = set(range(n))
-    while uncoloured:
-        best = None
-        best_key = None
-        for v in uncoloured:
-            key = (len(neighbour_colors[v]), degrees[v], -v)
-            if best_key is None or key > best_key:
-                best_key = key
-                best = v
-        v = best
-        used = neighbour_colors[v]
-        c = 0
-        while c in used:
-            c += 1
-        colors[v] = c
-        uncoloured.discard(v)
-        for u in np.nonzero(conflict[v])[0]:
-            u = int(u)
-            if colors[u] == -1:
-                neighbour_colors[u].add(c)
-    k = max(colors) + 1
-    groups = [[] for _ in range(k)]
-    for v, c in enumerate(colors):
-        groups[c].append(v)
-    return [g for g in groups if g]
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for i, j in zip(*np.nonzero(np.triu(conflict, 1))):
+        union(int(i), int(j))
+
+    comps = {}
+    for v in range(n):
+        comps.setdefault(find(v), []).append(v)
+    return list(comps.values())
 
 
-def balance_groups(groups, conflict):
-    """Even out folder sizes without ever breaking the no-alike-pair rule.
+def split_photos(paths, bits_list, gray_list, edge_list, col_list, ctimes,
+                 w_hash, w_gray, w_edge, w_color,
+                 sim_threshold, strong_gray_threshold,
+                 chunk=256, progress=False):
+    """Split the photos into (distinct, duplicates).
 
-    Repeatedly move a photo from the largest folder to the smallest folder that
-    contains NO conflicting (alike) photo.  Every move reduces the spread, so
-    this terminates.  Returns the (possibly reordered) group list.
-    """
-    groups = [list(g) for g in groups]
-    k = len(groups)
-    if k <= 1:
-        return groups
-    while True:
-        order = sorted(range(k), key=lambda i: len(groups[i]))
-        largest = order[-1]
-        smallest = order[0]
-        if len(groups[largest]) - len(groups[smallest]) <= 1:
-            break
-        moved = False
-        # Prefer the truly smallest folder; fall back to any folder that is
-        # still meaningfully smaller than the largest.
-        for cand in order:
-            if cand == largest:
-                continue
-            if len(groups[largest]) - len(groups[cand]) <= 1:
-                continue
-            for idx in list(groups[largest]):
-                clash = conflict[idx]
-                if any(clash[other] for other in groups[cand]):
-                    continue
-                groups[largest].remove(idx)
-                groups[cand].append(idx)
-                moved = True
-                break
-            if moved:
-                break
-        if not moved:
-            break
-    return groups
+    Builds the conflict graph, links it into look-alike groups, then keeps ONE
+    representative per group in `distinct` (its earliest shot) and sends the
+    remaining takes to `duplicates`.  Photos with no look-alike go to
+    `distinct` unchanged.
 
-
-def separate_groups(paths, bits_list, gray_list, edge_list, col_list,
-                    w_hash, w_gray, w_edge, w_color,
-                    sim_threshold, strong_gray_threshold,
-                    chunk=256, progress=False, balance=False):
-    """Full pipeline: conflict graph -> DSATUR colouring -> (optional) balance.
-
-    Returns (groups, S, Gs) where `groups` is a list of index lists (one per
-    folder) and `S`/`Gs` are the pairwise matrices used for reporting.
-
-    By default the unique (non-conflicting) photos are left pooled together, so
-    folders are as FEW and as PURE as possible.  Pass `balance=True` to spread
-    them out so the folders end up similar in size.
+    Returns (distinct, duplicates, info, comps, conflict, S, Gs) where
+      * distinct / duplicates — index lists, in shot order,
+      * info    — index -> (group_id, is_representative, representative_index),
+      * comps   — the look-alike groups (list of index lists).
     """
     conflict, S, Gs = build_conflict(
         paths, bits_list, gray_list, edge_list, col_list,
         w_hash, w_gray, w_edge, w_color, sim_threshold, strong_gray_threshold,
         chunk=chunk, progress=progress)
-    groups = dsatur_colour(conflict)
-    if balance:
-        groups = balance_groups(groups, conflict)
-    return groups, S, Gs
+
+    def shot_key(i):
+        return (ctimes[i] or "~", os.path.basename(paths[i]))
+
+    comps = [sorted(c, key=shot_key) for c in look_alike_groups(conflict)]
+    comps.sort(key=lambda c: shot_key(c[0]))
+
+    distinct, duplicates = [], []
+    info = {}
+    for c, members in enumerate(comps, 1):
+        gid = f"LA_{c:04d}"
+        rep = members[0]                      # earliest shot of the group
+        for m in members:
+            info[m] = (gid, m == rep, rep)
+        distinct.append(rep)
+        duplicates.extend(m for m in members if m != rep)
+
+    return distinct, duplicates, info, comps, conflict, S, Gs
 
 
-def _log_decisions(paths, groups, S, Gs, sim_threshold, strong_gray_threshold):
-    """Write a human-readable reason per folder and per forced-apart pair."""
-    n_conflicts = int(np.count_nonzero(np.triu(S >= sim_threshold, 1))
-                      + np.count_nonzero(np.triu(Gs >= strong_gray_threshold, 1)))
-    log.info("separation summary: %d folder(s) from %d forced-apart pair(s)",
-             len(groups), n_conflicts)
-    for rank, members in enumerate(sorted(groups, key=len, reverse=True), 1):
-        names = ", ".join(os.path.basename(paths[i]) for i in sorted(members))
-        log.info("FOLDER %02d  size=%d  members: %s", rank, len(members), names)
+def _log_decisions(paths, comps, info, conflict):
+    """Write a human-readable account of every look-alike group."""
+    n_pairs = int(np.count_nonzero(np.triu(conflict, 1)))
+    multi = [c for c in comps if len(c) > 1]
+    log.info("look-alike groups: %d group(s) with >1 take, %d unique photo(s); "
+             "%d alike pair(s)", len(multi), len(comps) - len(multi), n_pairs)
+    for comp in sorted(multi, key=len, reverse=True):
+        gid, _is_rep, rep = info[comp[0]]
+        extras = ", ".join(os.path.basename(paths[i])
+                           for i in comp if i != rep)
+        log.info("  GROUP %s size=%d  distinct: %s  duplicates: %s",
+                 gid, len(comp), os.path.basename(paths[rep]), extras)
+
+
+def _reset_output(out_dir):
+    """Remove this run's own previously produced folders so no stale copies stay.
+
+    Only our output directory is touched: `distinct/`, `duplicates/` and the
+    `group_*` folders written by older versions.  Source photos are never
+    touched.
+    """
+    if not os.path.isdir(out_dir):
+        return
+    for name in (GROUP_DISTINCT, GROUP_DUPLICATES):
+        p = os.path.join(out_dir, name)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+    for name in os.listdir(out_dir):
+        p = os.path.join(out_dir, name)
+        if name.startswith("group_") and os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -424,12 +405,13 @@ def process_folder(folder, out_dir, args):
     # ---- Phase 1: read each image and build its fingerprint ---------------- #
     print(f"  [1/3] fingerprinting {len(paths)} image(s) ...")
     keep, bits_list, gray_list, edge_list, col_list = [], [], [], [], []
+    ctimes = []
     total = len(paths)
     t1 = time.time()
     for idx, p in enumerate(paths, 1):
         name = os.path.basename(p)
-        b, gv, ev, cv = features_of(p, args.hash_size, args.struct_grid,
-                                    args.grid)
+        b, gv, ev, cv, ct = features_of(p, args.hash_size, args.struct_grid,
+                                        args.grid)
         if b is None:
             print(f"    [{idx}/{total}] [warn] unreadable: {name}")
             log.warning("SKIP unreadable [%d/%d]: %s", idx, total, name)
@@ -439,6 +421,7 @@ def process_folder(folder, out_dir, args):
         gray_list.append(gv)
         edge_list.append(ev)
         col_list.append(cv)
+        ctimes.append(ct)
         if idx % 25 == 0 or idx == total:
             rate = idx / max(time.time() - t1, 1e-6)
             eta = (total - idx) / rate if rate > 0 else 0
@@ -451,44 +434,33 @@ def process_folder(folder, out_dir, args):
     print(f"  [1/3] done in {time.time() - t1:.1f}s "
           f"({len(paths)} fingerprint(s))")
 
-    # ---- Phase 2: build conflict graph, colour, balance -------------------- #
+    # ---- Phase 2: find look-alike groups, split distinct / duplicates ------ #
     pairs = len(paths) * (len(paths) - 1) // 2
-    print(f"  [2/3] separating {len(paths)} image(s) ({pairs} pairs) "
+    print(f"  [2/3] comparing {len(paths)} image(s) ({pairs} pairs) "
           f"(alike if combined>= {args.similar_threshold} with weights "
           f"h/g/e/c = {args.w_hash}/{args.w_gray}/{args.w_edge}/{args.w_color}, "
           f"or struct>= {args.strong_gray_threshold}) ...")
     t2 = time.time()
-    groups, S, Gs = separate_groups(
-        paths, bits_list, gray_list, edge_list, col_list,
+    (distinct, duplicates, info, comps, conflict,
+     S, Gs) = split_photos(
+        paths, bits_list, gray_list, edge_list, col_list, ctimes,
         args.w_hash, args.w_gray, args.w_edge, args.w_color,
-        args.similar_threshold, args.strong_gray_threshold,
-        progress=True, balance=args.balance)
+        args.similar_threshold, args.strong_gray_threshold, progress=True)
+    n_multi = sum(1 for c in comps if len(c) > 1)
     print(f"  [2/3] done in {time.time() - t2:.1f}s "
-          f"({len(groups)} folder(s))")
-    log.info("[2/3] separated %d image(s) into %d folder(s) in %.1fs",
-             len(paths), len(groups), time.time() - t2)
-    _log_decisions(paths, groups, S, Gs, args.similar_threshold,
-                   args.strong_gray_threshold)
+          f"({n_multi} look-alike group(s) -> {len(distinct)} distinct, "
+          f"{len(duplicates)} duplicate(s))")
+    log.info("[2/3] split %d image(s) in %.1fs: %d look-alike group(s), "
+             "%d kept in distinct/, %d in duplicates/",
+             len(paths), time.time() - t2, n_multi, len(distinct),
+             len(duplicates))
+    _log_decisions(paths, comps, info, conflict)
 
-    # capture-time cache (used for ordering + report)
-    ctime = {}
-
-    def ct(i):
-        if i not in ctime:
-            ctime[i] = read_capture_time(paths[i]) or ""
-        return ctime[i]
-
-    # Order folders: biggest first, then earliest capture time, then name.
-    def gkey(members):
-        times = [ct(i) or "~" for i in members]
-        names = sorted(os.path.basename(paths[i]) for i in members)
-        return (-len(members), min(times), names[0])
-
-    groups.sort(key=gkey)
-
+    # ---- Phase 3: copy the two folders + write the reports ----------------- #
+    _reset_output(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    # collision-safe copying (matters only when --recursive flattens sub-folders)
+    # collision-safe copying (matters only when two folders share file names)
     used = {}
 
     def place(src, dest_dir):
@@ -504,45 +476,56 @@ def process_folder(folder, out_dir, args):
         dest = os.path.join(dest_dir, base)
         shutil.copy2(src, dest)
 
-    print(f"  [3/3] writing {len(groups)} folder(s) to '{out_dir}' ...")
-    rows = []          # (group_id, file, group_size, max_similarity, capture_time)
-    n_groups = 0
-    sizes = []
-
-    for members in groups:
-        size = len(members)
-        n_groups += 1
-        gid = f"{n_groups:04d}"
-        dest_dir = os.path.join(out_dir, f"group_{gid}")
-        sizes.append(size)
-        # order within the folder by capture time, then name
-        ordered = sorted(members, key=lambda i: (ct(i) or "~",
-                                                 os.path.basename(paths[i])))
+    print(f"  [3/3] writing 2 folder(s) to '{out_dir}' ...")
+    for label, members in ((GROUP_DISTINCT, distinct),
+                           (GROUP_DUPLICATES, duplicates)):
+        dest_dir = os.path.join(out_dir, label)
+        os.makedirs(dest_dir, exist_ok=True)
         for m in members:
-            if size > 1:
-                best = max(float(S[m, o]) for o in members if o != m)
-            else:
-                best = 0.0
-            rows.append((gid, os.path.basename(paths[m]), size,
-                         round(best, 3), ct(m)))
-        for m in ordered:
             place(paths[m], dest_dir)
 
+    # highest similarity of each photo to the other takes of its own group
+    # (size-1 groups: to any other photo in the folder)
+    comp_size = {}
+    max_sim = {}
+    for comp in comps:
+        cid = info[comp[0]][0]
+        comp_size[cid] = len(comp)
+        for m in comp:
+            if len(comp) > 1:
+                max_sim[m] = max(float(S[m, o]) for o in comp if o != m)
+            else:
+                max_sim[m] = max((float(S[m, o]) for o in range(len(paths))
+                                  if o != m), default=0.0)
+
+    rows = []          # [group, file, group_id, group_size, max_sim, dup_of, time]
+    for label, members in ((GROUP_DISTINCT, distinct),
+                           (GROUP_DUPLICATES, duplicates)):
+        for m in members:
+            cid, is_rep, rep = info[m]
+            rows.append([label,
+                         os.path.basename(paths[m]),
+                         cid,
+                         comp_size[cid],
+                         round(max_sim[m], 3),
+                         "" if is_rep else os.path.basename(paths[rep]),
+                         ctimes[m]])
+
+    headers = ["group", "file", "look_alike_group", "look_alike_size",
+               "max_similarity", "duplicate_of", "capture_time"]
+
     # ---- CSV report ------------------------------------------------------ #
-    csv_path = os.path.join(out_dir, "groups.csv")
+    csv_path = os.path.join(out_dir, "report.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["group_id", "file", "group_size", "max_similarity",
-                    "capture_time"])
+        w.writerow(headers)
         w.writerows(rows)
 
     # ---- Excel report ---------------------------------------------------- #
-    xlsx_path = os.path.join(out_dir, "groups.xlsx")
+    xlsx_path = os.path.join(out_dir, "report.xlsx")
     wb = Workbook()
     ws = wb.active
-    ws.title = "Groups"
-    headers = ["group_id", "file", "group_size", "max_similarity",
-               "capture_time"]
+    ws.title = "Distinct vs duplicates"
     ws.append(headers)
     for c in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=c)
@@ -550,40 +533,32 @@ def process_folder(folder, out_dir, args):
         cell.fill = PatternFill("solid", fgColor="305496")
         cell.alignment = Alignment(horizontal="center")
 
-    color_for = {}
-    for gid, fname, size, sim, ctv in rows:
-        if gid not in color_for:
-            try:
-                idx = int(gid) - 1
-            except ValueError:
-                idx = 0
-            color_for[gid] = PALETTE[idx % len(PALETTE)]
-        ws.append([gid, fname, size, sim, ctv])
-        fill = color_for[gid]
-        ws.cell(row=ws.max_row, column=1).fill = PatternFill("solid",
-                                                             fgColor=fill)
+    for label, fname, cid, size, sim, dup_of, ctv in rows:
+        ws.append([label, fname, cid, size, sim, dup_of, ctv])
+        ws.cell(row=ws.max_row, column=1).fill = PatternFill(
+            "solid", fgColor=GROUP_FILL[label])
 
-    for i, w in enumerate([14, 34, 12, 14, 22], 1):
+    for i, w in enumerate([13, 34, 17, 15, 14, 34, 22], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
     wb.save(xlsx_path)
 
-    largest = max(sizes, default=0)
-    smallest = min(sizes, default=0)
-    print(f"  folders          : {n_groups}  "
-          f"(largest: {largest}, smallest: {smallest})")
+    print(f"  distinct         : {len(distinct)} image(s)")
+    print(f"  duplicates       : {len(duplicates)} image(s) "
+          f"({n_multi} look-alike group(s) trimmed)")
     print(f"  output           : {out_dir}")
     print(f"  report           : {csv_path}")
     print(f"  done in {time.time() - t0:.1f}s")
-    log.info("[3/3] wrote %d folder(s) to %s", n_groups, out_dir)
+    log.info("[3/3] wrote distinct/ (%d) + duplicates/ (%d) to %s",
+             len(distinct), len(duplicates), out_dir)
 
     return {
         "folder": folder,
         "out": out_dir,
         "images": len(paths),
-        "groups": n_groups,
-        "largest": largest,
-        "smallest": smallest,
+        "distinct": len(distinct),
+        "duplicates": len(duplicates),
+        "groups": n_multi,
         "csv": csv_path,
     }
 
@@ -593,26 +568,26 @@ def process_folder(folder, out_dir, args):
 # --------------------------------------------------------------------------- #
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Distribute photos so SIMILAR ones land in DIFFERENT "
-                    "folders: every output folder ends up holding only "
-                    "visibly distinct photos. Give one folder path; every "
-                    "folder under it that holds images gets its own group "
-                    "folders, created inside it. Local, free, non-destructive.",
+        description="Split photos into TWO folders: 'distinct' (one "
+                    "representative of every look-alike group + every unique "
+                    "photo) and 'duplicates' (all remaining extra takes). Give "
+                    "one folder path; every folder under it that holds images "
+                    "gets its own distinct/ + duplicates/ pair, created inside "
+                    "it. Local, free, non-destructive.",
     )
     p.add_argument("path",
                    help="folder to scan; every nested folder holding images is "
-                        "separated, with a '<out-name>/' folder created inside "
-                        "it")
+                        "split, with a '<out-name>/' folder created inside it")
     p.add_argument("--out-name", default=DEFAULT_OUT_NAME,
-                   help="name of the group folder created inside each image "
+                   help="name of the output folder created inside each image "
                         f"folder (default: {DEFAULT_OUT_NAME})")
     p.add_argument("--hash-size", type=int, default=8,
                    help="pHash bits per side (default 8 -> 64-bit hash)")
     p.add_argument("--similar-threshold", type=float, default=0.60,
                    help="min COMBINED similarity (weighted blend of pHash, "
                         "structure, edge and colour) at which two photos are "
-                        "treated as alike and forced into DIFFERENT folders; "
-                        "lower = more separation / more folders (default 0.60)")
+                        "treated as the same shot; lower = more photos counted "
+                        "as duplicates / fewer kept as distinct (default 0.60)")
     p.add_argument("--w-hash", type=float, default=0.15,
                    help="weight of pHash similarity in the combined score. "
                         "Keep this LOW: on a same-backdrop shoot pHash barely "
@@ -630,17 +605,13 @@ def build_parser():
                         "score even for different poses (default 0.15)")
     p.add_argument("--strong-gray-threshold", type=float, default=0.80,
                    help="min grayscale structure correlation at which two "
-                        "photos are alike on its own (forced apart) even if the "
-                        "combined score is low (default 0.80)")
+                        "photos are duplicates on its own, even if the combined "
+                        "score is low (default 0.80)")
     p.add_argument("--grid", type=int, default=16,
                    help="colour correlation grid size, grid x grid (default 16)")
     p.add_argument("--struct-grid", type=int, default=48,
                    help="grayscale structure grid size, grid x grid "
                         "(default 48)")
-    p.add_argument("--balance", action="store_true", default=False,
-                   help="spread the unique photos evenly so all folders end up "
-                        "a similar size; off by default, which pools unique "
-                        "photos together and keeps the folder count minimal")
     return p
 
 
@@ -659,11 +630,10 @@ def main():
     log.info("root=%s  out_name=%s  python=%s", os.path.abspath(root),
              args.out_name, sys.version.split()[0])
     log.info("settings: hash_size=%d alike_if_combined>=%.2f weights h/g/e/c="
-             "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f grid=%d struct_grid=%d "
-             "balance=%s",
+             "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f grid=%d struct_grid=%d",
              args.hash_size, args.similar_threshold, args.w_hash, args.w_gray,
              args.w_edge, args.w_color, args.strong_gray_threshold, args.grid,
-             args.struct_grid, args.balance)
+             args.struct_grid)
     log.info("image folders found (%d):", len(folders))
     for f in folders:
         log.info("  - %s", os.path.relpath(f, root))
@@ -678,7 +648,7 @@ def main():
     n_folders = len(folders)
     run_t0 = time.time()
     for fi, folder in enumerate(folders, 1):
-        # Group folders are created INSIDE each image folder.
+        # distinct/ + duplicates/ are created INSIDE each image folder.
         out_dir = os.path.join(folder, args.out_name)
         rel = os.path.relpath(folder, root)
         print()
@@ -694,11 +664,13 @@ def main():
 
     print("\n=== Done ===")
     tot_images = sum(s["images"] for s in summaries)
-    tot_groups = sum(s["groups"] for s in summaries)
-    log.info("=== run done: %d image(s) -> %d folder(s) across %d folder(s) ===",
-             tot_images, tot_groups, len(summaries))
-    print(f"{tot_images} image(s) -> {tot_groups} folder(s) "
-          f"across {len(summaries)} folder(s).")
+    tot_distinct = sum(s["distinct"] for s in summaries)
+    tot_dups = sum(s["duplicates"] for s in summaries)
+    log.info("=== run done: %d image(s) -> %d distinct + %d duplicates across "
+             "%d folder(s) ===", tot_images, tot_distinct, tot_dups,
+             len(summaries))
+    print(f"{tot_images} image(s) -> {tot_distinct} distinct + {tot_dups} "
+          f"duplicates across {len(summaries)} folder(s).")
 
 
 if __name__ == "__main__":
