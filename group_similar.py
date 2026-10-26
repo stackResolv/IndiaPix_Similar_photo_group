@@ -65,6 +65,7 @@ to keep more of them in distinct/).
 
 import argparse
 import csv
+import errno
 import json
 import logging
 import os
@@ -110,9 +111,19 @@ GROUP_FILL = {
 TAG_DATETIME = 306             # DateTime
 TAG_DATETIME_ORIGINAL = 36867  # DateTimeOriginal (capture time)
 
-# Cached per-image fingerprint file, kept inside the output folder so a re-run
-# (e.g. while tuning a threshold) does not re-decode thousands of images.
-CACHE_NAME = "features_cache.json"
+# Cached per-image fingerprints, kept inside the output folder so a re-run
+# (e.g. while tuning a threshold, or after an interruption) does not re-decode
+# thousands of images.  A DIRECTORY of incremental .npz shards, not one big
+# file, so a long first pass is resumable.
+CACHE_DIR = "_fingerprint_cache"
+
+# How many fingerprints to buffer before writing a shard.  Smaller = less work
+# lost if the run is killed; 1000 is a good balance.
+CACHE_SHARD = 1000
+
+# Also force a cache flush after this many seconds, so a slow I/O-bound run still
+# checkpoints regularly (1000 big camera files can take minutes to read).
+CACHE_FLUSH_SECONDS = 60.0
 
 # Module logger.  Console progress is still printed directly; the log file
 # records the full story: what was scanned, which photos are look-alikes, which
@@ -233,59 +244,119 @@ def _fingerprint_job(args):
 # --------------------------------------------------------------------------- #
 # Cache
 # --------------------------------------------------------------------------- #
-def _cache_path(out_dir):
-    return os.path.join(out_dir, CACHE_NAME)
+def _cache_dir(out_dir):
+    return os.path.join(out_dir, CACHE_DIR)
+
+
+def _meta_path(cdir):
+    return os.path.join(cdir, "meta.json")
+
+
+def _shard_paths(cdir):
+    try:
+        names = sorted(n for n in os.listdir(cdir)
+                       if n.startswith("shard_") and n.endswith(".npz"))
+    except OSError:
+        return []
+    return [os.path.join(cdir, n) for n in names]
+
+
+def _u8(a):
+    """Store a 0-255 float grid as uint8 (the JPEG source is 8-bit anyway)."""
+    return np.clip(np.rint(a), 0, 255).astype(np.uint8)
 
 
 def _load_cache(out_dir, meta):
-    """Return {abspath: record} if the cache matches `meta`, else {}."""
-    p = _cache_path(out_dir)
+    """Load every cached fingerprint that matches `meta`; {} otherwise.
+
+    Shards are read with np.load — a few vectorised reads, far cheaper than
+    parsing the single multi-hundred-megabyte JSON this replaced.  Because
+    shards are written as we go, a run that was stopped at photo 20 000 of
+    22 815 still contributes those 20 000 fingerprints.
+    """
+    cdir = _cache_dir(out_dir)
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            blob = json.load(f)
+        with open(_meta_path(cdir), "r", encoding="utf-8") as f:
+            if json.load(f) != meta:
+                return {}
     except Exception:
         return {}
-    if blob.get("meta") != meta:
-        return {}
+
     out = {}
-    try:
-        for path, rec in blob.get("items", {}).items():
-            out[path] = {
-                "bits": np.asarray(rec["bits"], dtype=np.uint8),
-                "gray": np.asarray(rec["gray"], dtype=np.float32),
-                "col": np.asarray(rec["col"], dtype=np.float32),
-                "sharp": float(rec["sharp"]),
-                "ctime": rec["ctime"],
-                "stamp": tuple(rec["stamp"]),
-            }
-    except Exception:
-        return {}
+    for sp in _shard_paths(cdir):
+        try:
+            with np.load(sp, allow_pickle=False) as z:
+                paths = z["paths"]
+                bits, gray, col = z["bits"], z["gray"], z["col"]
+                sharp, ctime = z["sharp"], z["ctime"]
+                size, mtime = z["size"], z["mtime"]
+                s2 = gray.shape[1]
+                for k in range(len(paths)):
+                    out[str(paths[k])] = {
+                        "bits": bits[k].astype(np.uint8),
+                        "gray": gray[k].astype(np.float32),
+                        "col": col[k].astype(np.float32),
+                        "sharp": float(sharp[k]),
+                        "ctime": str(ctime[k]),
+                        "stamp": (int(size[k]), int(mtime[k])),
+                        "grid2": s2,
+                    }
+        except Exception as e:
+            log.warning("cache shard '%s' unreadable: %s", sp, e)
     return out
 
 
-def _save_cache(out_dir, meta, records):
-    blob = {
-        "meta": meta,
-        "items": {
-            path: {
-                "bits": rec["bits"].tolist(),
-                "gray": np.round(rec["gray"], 4).tolist(),
-                "col": np.round(rec["col"], 4).tolist(),
-                "sharp": rec["sharp"],
-                "ctime": rec["ctime"],
-                "stamp": list(rec["stamp"]),
-            }
-            for path, rec in records.items()
-        },
-    }
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-        tmp = _cache_path(out_dir) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(blob, f)
-        os.replace(tmp, _cache_path(out_dir))
-    except Exception as e:
-        log.warning("cache write failed: %s", e)
+class ShardWriter:
+    """Append fingerprints to .npz shards, flushed every CACHE_SHARD photos.
+
+    This periodic flush is what makes the long first pass RESUMABLE: stop the
+    run part-way and the work already done is on disk.
+    """
+
+    def __init__(self, out_dir, meta, shard_size=CACHE_SHARD,
+                 flush_seconds=CACHE_FLUSH_SECONDS):
+        self.dir = _cache_dir(out_dir)
+        self.shard_size = max(1, shard_size)
+        self.flush_seconds = flush_seconds
+        self.buf = []
+        self.t_last = time.time()
+        self.n = len(_shard_paths(self.dir))
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(_meta_path(self.dir), "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+        except OSError as e:
+            log.warning("cache directory unavailable: %s", e)
+
+    def add(self, path, rec):
+        self.buf.append((path, rec))
+        if (len(self.buf) >= self.shard_size
+                or time.time() - self.t_last >= self.flush_seconds):
+            self.flush()
+
+    def flush(self):
+        if not self.buf:
+            return
+        rows = self.buf
+        try:
+            np.savez_compressed(
+                os.path.join(self.dir, f"shard_{self.n:05d}.npz"),
+                paths=np.array([p for p, _ in rows]),
+                bits=np.stack([r["bits"] for _, r in rows]).astype(np.uint8),
+                gray=np.stack([_u8(r["gray"]).ravel() for _, r in rows]),
+                col=np.stack([_u8(r["col"]).ravel() for _, r in rows]),
+                sharp=np.array([r["sharp"] for _, r in rows], dtype=np.float32),
+                ctime=np.array([r["ctime"] for _, r in rows]),
+                size=np.array([r["stamp"][0] for _, r in rows], dtype=np.int64),
+                mtime=np.array([r["stamp"][1] for _, r in rows], dtype=np.int64),
+            )
+            self.n += 1
+            log.debug("cache shard %d written (%d fingerprint(s))",
+                      self.n, len(rows))
+        except Exception as e:
+            log.warning("cache shard write failed: %s", e)
+        self.buf = []
+        self.t_last = time.time()
 
 
 def _stamp(path):
@@ -305,6 +376,30 @@ def _z_rows(a, copy=True):
     a = np.array(a, dtype=np.float32, copy=copy)
     a -= a.mean(axis=1, keepdims=True)
     return a / (a.std(axis=1, keepdims=True) + 1e-6)
+
+
+def _residual_z(raw, bg, eps=1e-3, chunk=2048):
+    """Normalise each row of (raw - bg), falling back to the RAW row when the
+    residual is degenerate.
+
+    A row whose residual has no variance is one that *is* the background — the
+    pathological case being a folder of identical photos, or a folder with a
+    single photo.  There the background estimate equals every frame, the
+    residual cancels to zero, and a straight normalisation would give a zero
+    vector that matches nothing.  Falling back to the raw frame keeps such
+    photos comparable (they are then trivially alike — which is correct).
+    """
+    n = raw.shape[0]
+    out = np.empty_like(raw)
+    for i0 in range(0, n, chunk):
+        i1 = min(n, i0 + chunk)
+        block = raw[i0:i1] - bg
+        bad = block.std(axis=1) < eps
+        if bad.any():
+            block[bad] = raw[i0:i1][bad]
+        block -= block.mean(axis=1, keepdims=True)
+        out[i0:i1] = block / (block.std(axis=1, keepdims=True) + 1e-6)
+    return out
 
 
 def build_descriptors(grays, cols, struct_grid, color_grid, sample=400, seed=0):
@@ -331,11 +426,9 @@ def build_descriptors(grays, cols, struct_grid, color_grid, sample=400, seed=0):
     bg_gray = np.median(grays[idx], axis=0)
     bg_col = np.median(cols[idx], axis=0)
 
-    # Structure: residual luminance.  Subtracted IN PLACE because on a 28k
-    # folder a second copy of this matrix is ~260 MB for nothing.
-    grays -= bg_gray
-    R_gray = _z_rows(grays, copy=False)
-    grays = None
+    # Structure: residual luminance.  Chunked so peak memory stays flat, and
+    # with a raw-frame fallback for the degenerate rows described above.
+    R_gray = _residual_z(grays, bg_gray)
 
     # Edges: gradient magnitude of the RESIDUAL, so backdrop seams vanish.
     g3 = R_gray.reshape(-1, struct_grid, struct_grid)
@@ -343,10 +436,9 @@ def build_descriptors(grays, cols, struct_grid, color_grid, sample=400, seed=0):
     R_edge = _z_rows(np.hypot(dx, dy).reshape(n, s2), copy=False)
 
     # Colour: residual per channel, each channel normalised, then concatenated.
-    cols -= bg_col
-    c3 = cols.reshape(n, 3, color_grid * color_grid)
     R_col = np.concatenate(
-        [_z_rows(c3[:, c, :], copy=False) for c in range(3)], axis=1)
+        [_residual_z(cols[:, ch::3], bg_col[ch::3]) for ch in range(3)],
+        axis=1)
 
     return (R_gray.astype(np.float32, copy=False),
             R_edge.astype(np.float32, copy=False),
@@ -639,14 +731,47 @@ def find_image_folders(root, out_name):
     return folders
 
 
-def _reset_output(out_dir):
+def _transfer(src, dest, move):
+    """Put one photo at `dest` — by moving it (move=True) or copying it.
+
+    Moving is what saves the disk space: there is never a second full copy of
+    every duplicate.
+      * same volume  -> os.rename, which is instant and needs no extra space;
+      * other volume -> shutil.move (copy, then unlink the source).
+    """
+    if not move:
+        shutil.copy2(src, dest)
+        return
+    try:
+        os.rename(src, dest)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        shutil.move(src, dest)
+
+
+def _reset_output(out_dir, keep_existing=False, source_has_images=True):
     """Remove this run's own previously produced folders so no stale copies stay.
 
     Only our output directory is touched: `distinct/`, `duplicates/` and the
     `group_*` folders written by older versions.  Source photos and the
     fingerprint cache are never touched.
+
+    Two data-loss guards, because a re-run must never destroy photos:
+      * `keep_existing`  -- set whenever this run will MOVE photos, since the
+        folders may already hold originals moved by an earlier run.
+      * `source_has_images` -- if the source folder no longer holds any photos,
+        the output folders ARE the collection (a previous move emptied the
+        source), so they are left untouched and only reports are refreshed.
     """
-    if not os.path.isdir(out_dir):
+    if keep_existing or not os.path.isdir(out_dir):
+        return
+    if not source_has_images:
+        print("  [safe] output folders already hold the moved photos and the "
+              "source folder is empty\n"
+              "         -> they are NOT cleared; only the reports are "
+              "refreshed")
+        log.info("output kept: source folder has no images left (moved state)")
         return
     for name in (GROUP_DISTINCT, GROUP_DUPLICATES):
         p = os.path.join(out_dir, name)
@@ -678,13 +803,14 @@ def fingerprint_folder(paths, out_dir, args):
         ap = os.path.abspath(p)
         try:
             stamp = _stamp(ap)
+            nbytes = os.path.getsize(ap)
         except OSError:
             continue
         hit = cache.get(ap)
         if hit and hit["stamp"] == stamp:
             records[ap] = hit
         else:
-            todo.append((ap, stamp))
+            todo.append((ap, stamp, nbytes))
 
     cached = len(records)
     if cached:
@@ -693,32 +819,53 @@ def fingerprint_folder(paths, out_dir, args):
     else:
         print(f"  [1/3] fingerprinting {len(todo)} image(s) ...")
 
+    # Bytes still to read.  This is what governs wall time: the decode is cheap
+    # (DCT-scaled), so on big camera files the phase is bound by disk throughput.
+    bytes_todo = sum(b for _, _, b in todo)
+    bytes_done = 0
+    if todo:
+        print(f"  [1/3] {bytes_todo / 1073741824:.1f} GB to read for "
+              f"{len(todo)} image(s); decoding on "
+              f"{max(1, args.jobs)} process(es)")
+
+    writer = None if args.no_cache else ShardWriter(out_dir, meta)
+
+    def _done(k, ap, rec, stamp, nbytes):
+        nonlocal bytes_done
+        bytes_done += nbytes
+        rec["stamp"] = stamp
+        records[ap] = rec
+        if writer is not None:
+            writer.add(ap, rec)
+        if k % 25 == 0 or k == len(todo):
+            el = max(time.time() - t0, 1e-6)
+            rate = k / el
+            mbs = bytes_done / 1048576 / el
+            print(f"    [{k}/{len(todo)}] {rate:.1f} img/s, "
+                  f"{mbs:.0f} MB/s, ~{(len(todo) - k) / rate:.0f}s left - "
+                  f"{os.path.basename(ap)}")
+
     if todo:
         jobs = max(1, args.jobs)
         if jobs == 1:
-            for k, (ap, stamp) in enumerate(todo, 1):
+            for k, (ap, stamp, nbytes) in enumerate(todo, 1):
                 rec = _fingerprint(ap, args.hash_size, args.struct_grid,
                                    args.grid, args.draft_px)
                 if "error" in rec:
                     print(f"    [warn] unreadable: {os.path.basename(ap)}")
                     log.warning("SKIP unreadable: %s (%s)", ap, rec["error"])
                     continue
-                rec["stamp"] = stamp
-                records[ap] = rec
-                if k % 25 == 0 or k == len(todo):
-                    rate = k / max(time.time() - t0, 1e-6)
-                    print(f"    [{k}/{len(todo)}] {rate:.1f} img/s, "
-                          f"~{(len(todo) - k) / rate:.0f}s left - "
-                          f"{os.path.basename(ap)}")
+                _done(k, ap, rec, stamp, nbytes)
         else:
             with ProcessPoolExecutor(max_workers=jobs) as ex:
                 futs = {ex.submit(_fingerprint_job,
                                   (ap, args.hash_size, args.struct_grid,
-                                   args.grid, args.draft_px)): (ap, stamp)
-                        for ap, stamp in todo}
+                                   args.grid, args.draft_px)):
+                        (ap, stamp, nbytes)
+                        for ap, stamp, nbytes in todo}
                 done = 0
                 for fut in as_completed(futs):
-                    ap, stamp = futs[fut]
+                    ap, stamp, nbytes = futs[fut]
                     done += 1
                     rec = fut.result()
                     if rec.get("error"):
@@ -726,16 +873,22 @@ def fingerprint_folder(paths, out_dir, args):
                         log.warning("SKIP unreadable: %s (%s)",
                                     ap, rec["error"])
                         continue
-                    rec["stamp"] = stamp
-                    records[ap] = rec
-                    if done % 25 == 0 or done == len(todo):
-                        rate = done / max(time.time() - t0, 1e-6)
-                        print(f"    [{done}/{len(todo)}] {rate:.1f} img/s, "
-                              f"~{(len(todo) - done) / rate:.0f}s left - "
-                              f"{os.path.basename(ap)}")
+                    _done(done, ap, rec, stamp, nbytes)
 
-    if not args.no_cache and todo:
-        _save_cache(out_dir, meta, records)
+    if writer is not None:
+        writer.flush()
+
+    if todo:
+        el = max(time.time() - t0, 1e-6)
+        mbs = bytes_done / 1048576 / el
+        print(f"  [1/3] throughput: {len(todo) / el:.1f} img/s, "
+              f"{mbs:.0f} MB/s over {bytes_done / 1073741824:.1f} GB")
+        log.info("fingerprint throughput: %.1f img/s, %.0f MB/s, %.1f GB read",
+                 len(todo) / el, mbs, bytes_done / 1073741824)
+        if mbs < 60:
+            print("  [1/3] note: that is slow for a local disk, so this phase "
+                  "is I/O-bound and raising --jobs will NOT help much. It is "
+                  "paid ONCE - the cache makes every later run skip it.")
 
     kept = [p for p in paths if os.path.abspath(p) in records]
     return kept, records
@@ -755,6 +908,13 @@ def process_folder(folder, out_dir, args):
     print(f"  images : {len(paths)}")
     log.info("")
     log.info("FOLDER %s  (%d image(s))", folder, len(paths))
+
+    if args.max_images and len(paths) > args.max_images:
+        print(f"  [limit] --max-images {args.max_images}: analysing the first "
+              f"{args.max_images} of {len(paths)} photo(s)")
+        log.info("LIMIT --max-images: %d of %d photo(s)", args.max_images,
+                 len(paths))
+        paths = paths[:args.max_images]
 
     # ---- Phase 1: fingerprint every image (parallel, cached) -------------- #
     paths, records = fingerprint_folder(paths, out_dir, args)
@@ -848,14 +1008,32 @@ def process_folder(folder, out_dir, args):
              n, time.time() - t2, n_multi, len(distinct), len(duplicates))
     _log_decisions(paths, comps, info)
 
-    # ---- Phase 3: copy the two folders + write the reports ----------------- #
-    _reset_output(out_dir)
-    os.makedirs(out_dir, exist_ok=True)
+    # ---- Phase 3: place the photos + write the reports -------------------- #
+    move = bool(getattr(args, "move", False))
+    dry = bool(getattr(args, "dry_run", False))
 
-    # collision-safe copying (matters only when two folders share file names)
+    if dry:
+        print("  [3/3] DRY RUN - nothing is written or moved "
+              f"({GROUP_DISTINCT}/ and {GROUP_DUPLICATES}/ untouched)")
+    elif move:
+        # NEVER delete here.  In move mode these folders can contain the only
+        # remaining copy of photos moved by an earlier run; a re-run must add
+        # to them, never clear them.
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"  [3/3] MOVING photos into 2 folder(s) to '{out_dir}' "
+              f"(originals leave the source folder) ...")
+        log.info("MOVE mode: existing output kept, nothing is deleted")
+    else:
+        _reset_output(out_dir, source_has_images=bool(paths))
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"  [3/3] copying photos into 2 folder(s) to '{out_dir}' ...")
+
+    # collision-safe naming (matters only when two folders share file names)
     used = {}
 
     def place(src, dest_dir):
+        if dry:
+            return
         os.makedirs(dest_dir, exist_ok=True)
         base = os.path.basename(src)
         if used.get((dest_dir, base)) not in (None, src):
@@ -865,16 +1043,20 @@ def process_folder(folder, out_dir, args):
                 k += 1
             base = f"{stem}_{k}{ext}"
         used[(dest_dir, base)] = src
-        dest = os.path.join(dest_dir, base)
-        shutil.copy2(src, dest)
+        _transfer(src, os.path.join(dest_dir, base), move)
 
-    print(f"  [3/3] writing 2 folder(s) to '{out_dir}' ...")
     for label, mem in ((GROUP_DISTINCT, distinct),
                        (GROUP_DUPLICATES, duplicates)):
         dest_dir = os.path.join(out_dir, label)
-        os.makedirs(dest_dir, exist_ok=True)
+        if not dry:
+            os.makedirs(dest_dir, exist_ok=True)
         for m in mem:
             place(paths[m], dest_dir)
+
+    if move and not dry:
+        log.info("MOVE mode: %d photo(s) relocated out of the source folder",
+                 n)
+        print(f"  moved            : {n} photo(s) left the source folder")
 
     # Highest similarity seen for each photo: against the other takes of its own
     # group, or — for a photo with no second take — against anything it was
@@ -909,34 +1091,40 @@ def process_folder(folder, out_dir, args):
     headers = ["group", "file", "look_alike_group", "look_alike_size",
                "max_similarity", "duplicate_of", "capture_time"]
 
-    # ---- CSV report ------------------------------------------------------ #
     csv_path = os.path.join(out_dir, "report.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(headers)
-        w.writerows(rows)
-
-    # ---- Excel report ---------------------------------------------------- #
     xlsx_path = os.path.join(out_dir, "report.xlsx")
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Distinct vs duplicates"
-    ws.append(headers)
-    for c in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=c)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="305496")
-        cell.alignment = Alignment(horizontal="center")
 
-    for label, fname, cid, size, sim, dup_of, ctv in rows:
-        ws.append([label, fname, cid, size, sim, dup_of, ctv])
-        ws.cell(row=ws.max_row, column=1).fill = PatternFill(
-            "solid", fgColor=GROUP_FILL[label])
+    if dry:
+        # A dry run touches nothing at all - it only reports the plan.
+        print(f"  (dry run) would write {csv_path}")
+        print(f"  (dry run) would write {xlsx_path}")
+    else:
+        # ---- CSV report -------------------------------------------------- #
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            w.writerows(rows)
 
-    for i, w in enumerate([13, 34, 17, 15, 14, 34, 22], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.freeze_panes = "A2"
-    wb.save(xlsx_path)
+        # ---- Excel report ------------------------------------------------ #
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Distinct vs duplicates"
+        ws.append(headers)
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="305496")
+            cell.alignment = Alignment(horizontal="center")
+
+        for label, fname, cid, size, sim, dup_of, ctv in rows:
+            ws.append([label, fname, cid, size, sim, dup_of, ctv])
+            ws.cell(row=ws.max_row, column=1).fill = PatternFill(
+                "solid", fgColor=GROUP_FILL[label])
+
+        for i, w in enumerate([13, 34, 17, 15, 14, 34, 22], 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.freeze_panes = "A2"
+        wb.save(xlsx_path)
 
     print(f"  distinct         : {len(distinct)} image(s)")
     print(f"  duplicates       : {len(duplicates)} image(s) "
@@ -1055,8 +1243,20 @@ def build_parser():
                         "fingerprinting (default 384; bigger = slower, no real "
                         "gain)")
     p.add_argument("--no-cache", action="store_true",
-                   help="ignore/refresh the fingerprint cache in the output "
-                        "folder")
+                   help="ignore the fingerprint cache and re-decode everything "
+                        "(normally NOT needed: shards are reused automatically)")
+    p.add_argument("--max-images", type=int, default=0,
+                   help="fingerprint/analyse only the first N photos of each "
+                        "folder (default 0 = all). Useful for a quick "
+                        "threshold trial on a huge folder")
+    p.add_argument("--move", action="store_true",
+                   help="MOVE the photos into distinct/ + duplicates/ instead "
+                        "of copying them. Saves the full second copy on disk, "
+                        "but the originals LEAVE the source folder - run "
+                        "--dry-run first to check the grouping")
+    p.add_argument("--dry-run", action="store_true",
+                   help="analyse and print what WOULD happen, writing and "
+                        "moving nothing. Use this to sanity-check --move")
     return p
 
 
@@ -1068,7 +1268,43 @@ def main():
 
     folders = find_image_folders(root, args.out_name)
     if not folders:
+        # A previous --move leaves no images in the source folders, so this is
+        # a state to explain rather than a plain error.
+        emptied = []
+        for dirpath, dirnames, _files in os.walk(root):
+            out = os.path.join(dirpath, args.out_name)
+            if os.path.basename(dirpath) == args.out_name:
+                continue
+            if any(os.path.isdir(os.path.join(out, n))
+                   for n in (GROUP_DISTINCT, GROUP_DUPLICATES)):
+                emptied.append(out)
+        if emptied:
+            print(f"Nothing left to split under '{root}': the photos have "
+                  f"already been moved out of the source folder(s):")
+            for out in emptied:
+                print(f"  - {out}")
+            print("\nThe split is already done - the photos now live in "
+                  "distinct/ and duplicates/ inside those folders.\n"
+                  "To re-tune thresholds, move them back into the source "
+                  "folder first (or re-run on a fresh copy of the originals)," 
+                  " then use --dry-run before committing with --move.")
+            sys.exit(0)
         sys.exit(f"error: no folders containing images found under '{root}'")
+
+    if args.move and not args.dry_run:
+        # Moving is irreversible for the source folder, so make the user say so.
+        print("MOVE mode: photos will be MOVED out of the source folders into "
+              "distinct/ and duplicates/.\n"
+              "Nothing is deleted, but the originals will no longer be in "
+              "their original folder.\n"
+              "Tip: run with --dry-run first to review the grouping, and keep "
+              "a backup of anything irreplaceable.")
+        try:
+            answer = input("Continue? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            sys.exit("aborted: nothing was moved")
 
     log_path = setup_logging(os.path.join(root, "group_similar.log"))
     log.info("=== group_similar run start ===")
