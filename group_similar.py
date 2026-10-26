@@ -8,47 +8,52 @@ group_similar.py — split a folder of photos into exactly TWO output folders:
   duplicates/  every extra take — the near-twins of the representative that was
                kept in distinct/.
 
-So a folder of 10 photos in which "standing" was shot 3x, "smiling" 2x and the
-other 5 are unique becomes:
+Similarity is measured 100% locally (no cloud, no cost, no API key) from image
+content, with THREE deliberate design choices that matter on a large shoot:
 
-  distinct/    standing #1, smiling #1, plus the 5 unique shots   (7 photos)
-  duplicates/  standing #2, standing #3, smiling #2               (3 photos)
+  1. BACKGROUND-RESIDUAL comparison.  The median frame of the folder is
+     estimated and subtracted before anything is compared, so the constant
+     studio wall / floor / lighting cancels out and what is left is the SUBJECT
+     (the pose).  Raw-frame comparison on a studio shoot mostly measures "same
+     backdrop", which is why different poses used to get merged.
 
-The representative of each look-alike group is its EARLIEST shot (by EXIF
-capture time, falling back to file name), so the kept frame is the first take;
-the later takes are the ones moved aside.
+  2. CANDIDATE GENERATION instead of all-pairs.  Two photos are only compared
+     when they are plausible candidates:
+       * close in shot order / capture time (a burst is shot seconds apart), or
+       * share most of their 64-bit pHash (multi-index hashing), or
+       * the folder is small (<= --exact-max images), in which case every pair
+         is compared exactly.
+     That turns n*(n-1)/2 pairs (392 million for 28k photos) into roughly
+     n * 20, with no dense n x n matrix in memory.
 
-Similarity is measured 100% locally (no cloud, no cost, no API key) using a
-blend of FOUR complementary, content-aware signals:
+  3. COMPLETE-LINKAGE grouping, NOT connected components.  A photo may only
+     join a group if it is alike to EVERY member already in it.  Single-linkage
+     (connected components) chains A~B~C~D... and collapses an entire shoot
+     into one group; complete linkage stops the chain, so genuinely different
+     poses stay in distinct/.
 
-  1. pHash (perceptual hash) ......... coarse, rotation-normalised, cheap.
-  2. Grayscale STRUCTURE correlation . the dominant signal: the whole frame is
-                                       downscaled and contrast-normalised, so
-                                       COMPOSITION is compared directly.
-  3. Edge correlation ................ captures outlines / object boundaries.
-  4. Colour correlation on a grid .... colour-aware detail (backdrop, outfit).
+Four complementary, content-aware signals are blended per candidate pair:
+
+  1. pHash ............................ coarse, rotation-normalised, cheap;
+                                        also drives candidate generation.
+  2. Grayscale STRUCTURE correlation .. the dominant signal: the background
+                                        residual is compared, so composition
+                                        (the pose) is what is measured.
+  3. Edge correlation ................. outlines of the residual subject.
+  4. Colour correlation ............... residual colour detail (outfit, props).
 
 Two photos are treated as "alike" (near duplicates) when EITHER:
   * their COMBINED similarity — a weighted blend of the four measures above,
     weighted by --w-hash / --w-gray / --w-edge / --w-color — is
-    >= --similar-threshold (default 0.60),  -- or
+    >= --similar-threshold (default 0.62),  -- or
   * their grayscale structure correlation alone is
-    >= --strong-gray-threshold (default 0.80) (near-identical composition).
+    >= --strong-gray-threshold (default 0.78) (near-identical composition).
 
-These "alike" pairs link the photos into LOOK-ALIKE GROUPS (connected
-components): every group is one burst of repeated takes of the same shot.
-Exactly one member of each group is kept in distinct/, the rest go to
-duplicates/.
-
-Why structure dominates the blend: on a studio shoot every frame shares the
-backdrop and lighting, so pHash and colour barely discriminate (a same-backdrop
-pair already scores ~0.5 identical-ness on those alone) — weighting them heavily
-would mark DIFFERENT poses as alike.  The grayscale structure signal is the one
-that actually tracks composition, hence its high default weight.
+The representative of each group is its EARLIEST shot (by EXIF capture time,
+falling back to file name) unless --keeper sharpest is given.
 
 Usage:
-  # just give a folder path: every folder under it that holds images gets its
-  # own distinct/ + duplicates/ pair, created INSIDE that folder
+  # every folder under it that holds images gets its own distinct/ + duplicates/
   python3 group_similar.py "input_folder"
 
   # or point at one shoot folder
@@ -60,11 +65,13 @@ to keep more of them in distinct/).
 
 import argparse
 import csv
+import json
 import logging
 import os
 import shutil
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from PIL import Image, ImageOps, ExifTags
 import imagehash
@@ -102,6 +109,10 @@ GROUP_FILL = {
 # EXIF tag ids
 TAG_DATETIME = 306             # DateTime
 TAG_DATETIME_ORIGINAL = 36867  # DateTimeOriginal (capture time)
+
+# Cached per-image fingerprint file, kept inside the output folder so a re-run
+# (e.g. while tuning a threshold) does not re-decode thousands of images.
+CACHE_NAME = "features_cache.json"
 
 # Module logger.  Console progress is still printed directly; the log file
 # records the full story: what was scanned, which photos are look-alikes, which
@@ -149,31 +160,27 @@ def list_images(folder, recursive=False):
     return out
 
 
-def _nz(a):
-    """Flatten `a` and return it zero-mean / unit-std (a normalised vector)."""
-    a = a.ravel()
-    return (a - a.mean()) / (a.std() + 1e-6)
+# --------------------------------------------------------------------------- #
+# Per-image fingerprint (runs in worker processes)
+# --------------------------------------------------------------------------- #
+def _fingerprint(path, hash_size, struct_grid, color_grid, draft_px):
+    """Return a dict describing one image, or ('error', reason).
 
+    Decoding is deliberately cheap: JPEGs are decoded with DCT scaling
+    (``Image.draft``) straight down to ~`draft_px`, so a 24 MP frame costs a
+    fraction of a full decode.  Everything downstream works on small grids.
 
-def features_of(path, hash_size, struct_grid, color_grid):
-    """Return (phash_bits, gray_vec, edge_vec, color_vec, capture_time).
-
-    Returns (None, None, None, None, "") on failure.
-
-    Orientation is normalised (EXIF transpose) so rotated copies still match.
-    Every vector is zero-mean / unit-std so a plain normalised dot product IS
-    the correlation (a value in [-1, 1]).
-
-    * gray_vec  — the downscaled grayscale frame.  This is the main signal:
-                  it compares actual COMPOSITION, so an extra/missing person or
-                  object, or a different crop, drops the score.
-    * edge_vec  — gradient magnitude, emphasising outlines / object boundaries.
-    * color_vec — downscaled RGB, colour-aware (backdrop / outfit differences).
-    * capture_time — EXIF DateTimeOriginal/DateTime as a string, or "".
+    Stored per image (all raw, background subtraction happens later so it can
+    use the whole folder):
+      * bits  — pHash bit array (hash_size*hash_size)
+      * gray  — struct_grid x struct_grid float32 luminance
+      * col   — 3 x color_grid x color_grid float32 RGB
+      * sharp — variance of the Laplacian on `gray` (focus measure)
+      * ctime — EXIF DateTimeOriginal/DateTime string, or ""
     """
-    ctime = ""
     try:
         with Image.open(path) as im:
+            ctime = ""
             try:
                 exif = im.getexif()
                 try:
@@ -185,24 +192,430 @@ def features_of(path, hash_size, struct_grid, color_grid):
                     ctime = str(dto)
             except Exception:
                 pass
+
+            # Cheap decode: let the JPEG decoder scale down as it works.
+            try:
+                im.draft("RGB", (draft_px, draft_px))
+            except Exception:
+                pass
             im = ImageOps.exif_transpose(im)
+            if max(im.size) > draft_px:
+                im = im.copy()
+                im.thumbnail((draft_px, draft_px), Image.BILINEAR)
+
             g = im.convert("L")
             ph = imagehash.phash(g, hash_size=hash_size)
-            gray = np.asarray(g.resize((struct_grid, struct_grid), Image.BILINEAR),
-                              dtype=np.float32)
-            gy, gx = np.gradient(gray)
-            edge = np.hypot(gx, gy)
+            gray = np.asarray(
+                g.resize((struct_grid, struct_grid), Image.BILINEAR),
+                dtype=np.float32)
             col = np.asarray(
                 im.convert("RGB").resize((color_grid, color_grid), Image.BILINEAR),
                 dtype=np.float32)
-        gray_v = _nz(gray)
-        edge_v = _nz(edge)
-        col_v = np.concatenate([_nz(col[:, :, c]) for c in range(3)])
-        bits = np.asarray(ph.hash, dtype=np.int8).ravel()
-        return bits, gray_v, edge_v, col_v, ctime
+
+        gy, gx = np.gradient(gray)
+        lap = np.gradient(gy, axis=0) + np.gradient(gx, axis=1)
+        return {
+            "bits": np.asarray(ph.hash, dtype=np.uint8).ravel(),
+            "gray": gray.astype(np.float32),
+            "col": col.astype(np.float32),
+            "sharp": float(lap.var()),
+            "ctime": ctime,
+        }
     except Exception as e:
-        log.warning("cannot read '%s': %s: %s", path, type(e).__name__, e)
-        return None, None, None, None, ""
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _fingerprint_job(args):
+    """ProcessPoolExecutor adapter (single tuple argument)."""
+    return _fingerprint(*args)
+
+
+# --------------------------------------------------------------------------- #
+# Cache
+# --------------------------------------------------------------------------- #
+def _cache_path(out_dir):
+    return os.path.join(out_dir, CACHE_NAME)
+
+
+def _load_cache(out_dir, meta):
+    """Return {abspath: record} if the cache matches `meta`, else {}."""
+    p = _cache_path(out_dir)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+    except Exception:
+        return {}
+    if blob.get("meta") != meta:
+        return {}
+    out = {}
+    try:
+        for path, rec in blob.get("items", {}).items():
+            out[path] = {
+                "bits": np.asarray(rec["bits"], dtype=np.uint8),
+                "gray": np.asarray(rec["gray"], dtype=np.float32),
+                "col": np.asarray(rec["col"], dtype=np.float32),
+                "sharp": float(rec["sharp"]),
+                "ctime": rec["ctime"],
+                "stamp": tuple(rec["stamp"]),
+            }
+    except Exception:
+        return {}
+    return out
+
+
+def _save_cache(out_dir, meta, records):
+    blob = {
+        "meta": meta,
+        "items": {
+            path: {
+                "bits": rec["bits"].tolist(),
+                "gray": np.round(rec["gray"], 4).tolist(),
+                "col": np.round(rec["col"], 4).tolist(),
+                "sharp": rec["sharp"],
+                "ctime": rec["ctime"],
+                "stamp": list(rec["stamp"]),
+            }
+            for path, rec in records.items()
+        },
+    }
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        tmp = _cache_path(out_dir) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(blob, f)
+        os.replace(tmp, _cache_path(out_dir))
+    except Exception as e:
+        log.warning("cache write failed: %s", e)
+
+
+def _stamp(path):
+    st = os.stat(path)
+    return (st.st_size, st.st_mtime_ns)
+
+
+# --------------------------------------------------------------------------- #
+# Descriptors: background residual + normalisation
+# --------------------------------------------------------------------------- #
+def _z_rows(a, copy=True):
+    """Zero-mean / unit-std every ROW of a 2-D array (each photo separately).
+
+    With copy=False the mean is subtracted IN PLACE, which keeps peak memory
+    flat on very large folders (the caller owns and discards the array).
+    """
+    a = np.array(a, dtype=np.float32, copy=copy)
+    a -= a.mean(axis=1, keepdims=True)
+    return a / (a.std(axis=1, keepdims=True) + 1e-6)
+
+
+def build_descriptors(grays, cols, struct_grid, color_grid, sample=400, seed=0):
+    """Turn raw per-image grids into background-residual descriptors.
+
+    `grays` is (n, s*s) luminance, `cols` is (n, c*c*3) RGB, both raw.
+
+    The folder's shared background is estimated as the per-pixel MEDIAN over a
+    random sample of frames (bounded, so memory stays flat on huge folders).
+    Subtracting it means the correlation that follows measures the SUBJECT —
+    the pose — instead of "everyone shares this studio wall".
+
+    Returns (R_gray, R_edge, R_col) — all row-normalised, ready for dot products.
+    """
+    n = grays.shape[0]
+    s2, c2 = struct_grid * struct_grid, color_grid * color_grid
+    if n == 0:
+        return (np.zeros((0, s2), np.float32), np.zeros((0, s2), np.float32),
+                np.zeros((0, c2), np.float32))
+
+    rng = np.random.default_rng(seed)
+    idx = (np.arange(n) if n <= sample
+           else rng.choice(n, size=sample, replace=False))
+    bg_gray = np.median(grays[idx], axis=0)
+    bg_col = np.median(cols[idx], axis=0)
+
+    # Structure: residual luminance.  Subtracted IN PLACE because on a 28k
+    # folder a second copy of this matrix is ~260 MB for nothing.
+    grays -= bg_gray
+    R_gray = _z_rows(grays, copy=False)
+    grays = None
+
+    # Edges: gradient magnitude of the RESIDUAL, so backdrop seams vanish.
+    g3 = R_gray.reshape(-1, struct_grid, struct_grid)
+    dy, dx = np.gradient(g3, axis=(1, 2))
+    R_edge = _z_rows(np.hypot(dx, dy).reshape(n, s2), copy=False)
+
+    # Colour: residual per channel, each channel normalised, then concatenated.
+    cols -= bg_col
+    c3 = cols.reshape(n, 3, color_grid * color_grid)
+    R_col = np.concatenate(
+        [_z_rows(c3[:, c, :], copy=False) for c in range(3)], axis=1)
+
+    return (R_gray.astype(np.float32, copy=False),
+            R_edge.astype(np.float32, copy=False),
+            R_col.astype(np.float32, copy=False))
+
+
+# --------------------------------------------------------------------------- #
+# Candidate generation (avoids the O(n^2) full comparison)
+# --------------------------------------------------------------------------- #
+def _pair_key(a, b):
+    return (a, b) if a < b else (b, a)
+
+
+def candidate_pairs(paths, bits, ctimes, order, window, max_seconds,
+                    hash_bytes_keep, bucket_cap, exact_max):
+    """Return a sorted list of index pairs that deserve an exact comparison.
+
+    Three cheap sources, unioned:
+
+      1. LOCAL BURST WINDOW — photos within `window` positions of each other in
+         shot order, or within `max_seconds` of capture time.  Bursts are shot
+         back to back, so this catches the overwhelming majority of true
+         near-duplicates at n*window cost instead of n^2/2.
+
+      2. pHASH MULTI-INDEX — split the 64-bit pHash into 8 bytes.  Pairs that
+         agree on >= `hash_bytes_keep` of those bytes are candidates, which
+         finds repeated shots that are far apart in time without comparing
+         everything.
+
+      3. EXACT MODE — when the folder is small (n <= exact_max) just compare
+         every pair; the heuristic is only there to survive huge folders.
+    """
+    n = len(paths)
+    if n <= 1:
+        return []
+    if n <= exact_max:
+        return [(i, j) for i in range(n) for j in range(i + 1, n)]
+
+    pairs = set()
+
+    # --- 1. local window in shot order -------------------------------- #
+    for p in range(n):
+        i = order[p]
+        lo = order[max(0, p - window): p]
+        for j in lo:
+            pairs.add(_pair_key(i, j))
+    # --- 1b. capture-time window -------------------------------------- #
+    if max_seconds > 0:
+        secs = [ctimes[i] for i in range(n)]
+        timeable = [i for i in range(n) if secs[i]]
+        if len(timeable) > 1:
+            timeable.sort(key=lambda i: secs[i])
+            for a in range(len(timeable)):
+                i = timeable[a]
+                for b in range(a + 1, len(timeable)):
+                    j = timeable[b]
+                    if _seconds_between(secs[i], secs[j]) > max_seconds:
+                        break
+                    pairs.add(_pair_key(i, j))
+
+    # --- 2. pHash multi-index ----------------------------------------- #
+    if hash_bytes_keep > 0 and bits is not None and bits.size:
+        packed = np.packbits(bits.astype(np.uint8), axis=1)  # n x 8 bytes
+        nb = packed.shape[1]
+        keep = int(min(max(hash_bytes_keep, 1), nb))
+        buckets = {}
+        for i in range(n):
+            row = packed[i]
+            for k in range(nb):
+                buckets.setdefault((k, int(row[k])), []).append(i)
+
+        # Smallest buckets first: a byte value shared by thousands of photos
+        # carries no signal, and the vote budget stops the expensive ones, so
+        # this stage can never explode into an O(n^2) pair set on a 28k shoot.
+        votes = {}
+        budget = max(200_000, 40 * n)
+        for members in sorted(buckets.values(), key=len):
+            m = len(members)
+            if m < 2 or m > bucket_cap:
+                continue
+            cost = m * (m - 1) // 2
+            if cost > budget:
+                continue
+            budget -= cost
+            for a in range(m):
+                i = members[a]
+                for b in range(a + 1, m):
+                    key = _pair_key(i, members[b])
+                    v = votes.get(key)
+                    if v is None:
+                        votes[key] = 1
+                    elif v < keep:
+                        votes[key] = v + 1
+            if budget <= 0:
+                break
+        for key, v in votes.items():
+            if v >= keep:
+                pairs.add(key)
+
+    return sorted(pairs)
+
+
+def _seconds_between(a, b):
+    """Rough EXIF timestamp distance in seconds (0 when unparseable)."""
+    try:
+        ta = time.strptime(a, "%Y:%m:%d %H:%M:%S")
+        tb = time.strptime(b, "%Y:%m:%d %H:%M:%S")
+    except Exception:
+        return 0.0
+    return abs(time.mktime(ta) - time.mktime(tb))
+
+
+# --------------------------------------------------------------------------- #
+# Pairwise similarity on candidate pairs only
+# --------------------------------------------------------------------------- #
+def _scatter_max(n, idx, val):
+    """best[i] = max(val) over every entry where idx == i.  Vectorised."""
+    best = np.full(n, -np.inf, dtype=np.float32)
+    if idx.size == 0:
+        return best
+    o = np.lexsort((-val, idx))
+    idx_s = idx[o]
+    first = np.ones(idx_s.size, dtype=bool)
+    first[1:] = idx_s[1:] != idx_s[:-1]
+    best[idx_s[first]] = val[o][first]
+    return best
+
+
+def score_pairs(pairs, RG, RE, RC, bits, weights, bits_per_hash,
+                sim_threshold, strong_gray_threshold):
+    """Score candidate pairs, keeping only what the grouping actually needs.
+
+    Returns (alike, best_any, combined):
+      * alike    -- {(i, j): (combined, gray, edge, color, hash)} for the pairs
+                    that PASS the alike test.  Only this small subset is kept,
+                    so a 28k shoot does not hold ~840k score tuples in RAM.
+      * best_any -- float32 (n,): each photo's best combined score against
+                    anything it was compared with (used by the report).
+      * combined -- float32 (m,): every candidate's combined score, only used
+                    to print the distribution for calibration.
+
+    No n x n matrix is ever built; pairs are scored in ~4096-pair buffers.
+    """
+    w_hash, w_gray, w_edge, w_color = weights
+    n = RG.shape[0]
+    dg = RG.shape[1]
+    de = RE.shape[1]
+    dc = RC.shape[1]
+    alike = {}
+    I_all, J_all, S_all = [], [], []
+    buf = 4096
+    for s in range(0, len(pairs), buf):
+        chunk = pairs[s:s + buf]
+        I = np.fromiter((p[0] for p in chunk), dtype=np.int64, count=len(chunk))
+        J = np.fromiter((p[1] for p in chunk), dtype=np.int64, count=len(chunk))
+        Cg = np.einsum("ij,ij->i", RG[I], RG[J]) / dg
+        Ce = np.einsum("ij,ij->i", RE[I], RE[J]) / de
+        Cc = np.einsum("ij,ij->i", RC[I], RC[J]) / dc
+        if bits is not None and bits.size:
+            Dh = np.bitwise_xor(bits[I], bits[J]).sum(axis=1)
+            Ch = 1.0 - Dh.astype(np.float32) / bits_per_hash
+        else:
+            Ch = np.zeros(len(chunk), dtype=np.float32)
+        S = (w_hash * Ch + w_gray * Cg + w_edge * Ce + w_color * Cc)
+
+        I_all.append(I)
+        J_all.append(J)
+        S_all.append(S)
+
+        keep = (S >= sim_threshold) | (Cg >= strong_gray_threshold)
+        if keep.any():
+            for k in np.nonzero(keep)[0]:
+                alike[(int(I[k]), int(J[k]))] = (
+                    float(S[k]), float(Cg[k]), float(Ce[k]),
+                    float(Cc[k]), float(Ch[k]))
+
+    if I_all:
+        idx = np.concatenate(I_all + J_all)
+        val = np.concatenate(S_all + S_all)
+        best_any = _scatter_max(n, idx, val)
+    else:
+        best_any = np.full(n, -np.inf, dtype=np.float32)
+    combined = (np.concatenate(S_all) if S_all
+                else np.zeros(0, dtype=np.float32))
+    return alike, best_any, combined
+
+
+# --------------------------------------------------------------------------- #
+# Grouping: complete linkage (no chaining)
+# --------------------------------------------------------------------------- #
+def cluster_photos(paths, order, alike, link_mode):
+    """Group photos into look-alike sets without single-linkage chaining.
+
+    `alike` already holds ONLY the pairs that passed the similarity test (see
+    score_pairs), so a non-duplicate pair is never seen here.  How those alike
+    edges are turned into groups decides everything:
+
+      * complete (default) — a photo joins a group ONLY if it is alike to EVERY
+        member already in that group.  Stops A~B~C~D chains from collapsing an
+        entire shoot into one group.
+      * leader — a photo joins if it is alike to the group's representative.
+        Cheaper, but allows slow drift.
+      * single — classic connected components (old behaviour); kept only for
+        comparison, because it is what merges different poses.
+
+    Groups are built in shot order, so each group's first member is its
+    earliest take — the natural keeper.
+    """
+    nbrs = {}
+    for (i, j) in alike:
+        nbrs.setdefault(i, set()).add(j)
+        nbrs.setdefault(j, set()).add(i)
+
+    cluster_of = [-1] * len(paths)
+    members = []
+    reps = []
+
+    for i in order:
+        cands = nbrs.get(i, ())
+        if not cands:
+            cluster_of[i] = len(members)
+            members.append([i])
+            reps.append(i)
+            continue
+
+        # group the candidate neighbours by the cluster they already sit in
+        by_cluster = {}
+        for j in cands:
+            cj = cluster_of[j]
+            if cj >= 0:
+                by_cluster.setdefault(cj, []).append(j)
+        if not by_cluster:
+            cluster_of[i] = len(members)
+            members.append([i])
+            reps.append(i)
+            continue
+
+        best_c, best_score = None, -1.0
+        for cj, js in by_cluster.items():
+            sims = [alike[_pair_key(i, j)] for j in js]
+            if not sims:
+                continue
+            if link_mode == "complete":
+                # Must be alike to EVERY current member.  A member that is not
+                # in `js` was never a candidate for `i`, i.e. not alike, so a
+                # partial overlap is not enough — this is exactly what stops
+                # A~B~C chaining from swallowing a whole shoot.
+                if len(js) != len(members[cj]):
+                    continue
+                quality = min(s[0] for s in sims)
+            elif link_mode == "leader":
+                rep_key = _pair_key(i, reps[cj])
+                if rep_key not in alike:
+                    continue
+                quality = alike[rep_key][0]
+            else:  # single (connected components) — legacy behaviour
+                quality = max(s[0] for s in sims)
+            if quality > best_score:
+                best_c, best_score = cj, quality
+
+        if best_c is None:
+            cluster_of[i] = len(members)
+            members.append([i])
+            reps.append(i)
+        else:
+            cluster_of[i] = best_c
+            members[best_c].append(i)
+
+    return members, cluster_of
 
 
 # --------------------------------------------------------------------------- #
@@ -226,154 +639,12 @@ def find_image_folders(root, out_name):
     return folders
 
 
-# --------------------------------------------------------------------------- #
-# Similarity -> look-alike groups -> distinct / duplicates split
-# --------------------------------------------------------------------------- #
-def build_conflict(paths, bits_list, gray_list, edge_list, col_list,
-                   w_hash, w_gray, w_edge, w_color,
-                   sim_threshold, strong_gray_threshold,
-                   chunk=256, progress=False):
-    """Build the pairwise similarity matrices and the conflict graph.
-
-    Returns (conflict, S, Gs):
-      * conflict — bool (n x n): True where two photos are "alike" and therefore
-                   are near duplicates.
-      * S        — float32 (n x n): combined similarity (weighted blend).
-      * Gs       — float32 (n x n): grayscale structure correlation.
-
-    A pair conflicts when its combined similarity >= `sim_threshold` OR its
-    structure correlation >= `strong_gray_threshold`.
-    """
-    n = len(paths)
-    H = np.stack(bits_list).astype(np.int32)     # n x bits (0/1)
-    GR = np.stack(gray_list).astype(np.float32)  # n x dg (normalised rows)
-    ED = np.stack(edge_list).astype(np.float32)  # n x de
-    CO = np.stack(col_list).astype(np.float32)   # n x dc
-    bits = H.shape[1]
-    dg, de, dc = GR.shape[1], ED.shape[1], CO.shape[1]
-
-    # Precompute the transposed hash matrices once for the chunked products.
-    notH = (1 - H).T        # bits x n
-    Ht = H.T                # bits x n
-
-    S = np.empty((n, n), dtype=np.float32)
-    Gs = np.empty((n, n), dtype=np.float32)
-    conflict = np.zeros((n, n), dtype=bool)
-    t0 = time.time()
-    for i0 in range(0, n, chunk):
-        i1 = min(n, i0 + chunk)
-        A = H[i0:i1]                     # c x bits
-        notA = 1 - A                     # c x bits
-        Dh = A @ notH + notA @ Ht        # c x n (Hamming distance)
-        hash_sim = 1.0 - Dh / bits       # c x n, in [0, 1]
-        Cg = (GR[i0:i1] @ GR.T) / dg
-        Ce = (ED[i0:i1] @ ED.T) / de
-        Cc = (CO[i0:i1] @ CO.T) / dc
-        S[i0:i1] = w_hash * hash_sim + w_gray * Cg + w_edge * Ce + w_color * Cc
-        Gs[i0:i1] = Cg
-        conflict[i0:i1] = ((S[i0:i1] >= sim_threshold)
-                           | (Gs[i0:i1] >= strong_gray_threshold))
-        if progress and (i1 % (chunk * 8) == 0 or i1 == n):
-            pct = 100 * i1 / n
-            rate = i1 / max(time.time() - t0, 1e-6)
-            eta = (n - i1) / rate if rate > 0 else 0
-            print(f"    compared {i1}/{n} ({pct:.0f}%), ~{eta:.0f}s left")
-    np.fill_diagonal(S, 1.0)
-    np.fill_diagonal(Gs, 1.0)
-    np.fill_diagonal(conflict, False)
-    return conflict, S, Gs
-
-
-def look_alike_groups(conflict):
-    """Connected components of the conflict graph (union-find).
-
-    Every returned component is one burst of repeated takes: all its photos are
-    linked (directly or transitively) by "alike" edges.  Photos with no
-    look-alike at all come back as components of size 1.
-    """
-    n = conflict.shape[0]
-    parent = list(range(n))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[max(ra, rb)] = min(ra, rb)
-
-    for i, j in zip(*np.nonzero(np.triu(conflict, 1))):
-        union(int(i), int(j))
-
-    comps = {}
-    for v in range(n):
-        comps.setdefault(find(v), []).append(v)
-    return list(comps.values())
-
-
-def split_photos(paths, bits_list, gray_list, edge_list, col_list, ctimes,
-                 w_hash, w_gray, w_edge, w_color,
-                 sim_threshold, strong_gray_threshold,
-                 chunk=256, progress=False):
-    """Split the photos into (distinct, duplicates).
-
-    Builds the conflict graph, links it into look-alike groups, then keeps ONE
-    representative per group in `distinct` (its earliest shot) and sends the
-    remaining takes to `duplicates`.  Photos with no look-alike go to
-    `distinct` unchanged.
-
-    Returns (distinct, duplicates, info, comps, conflict, S, Gs) where
-      * distinct / duplicates — index lists, in shot order,
-      * info    — index -> (group_id, is_representative, representative_index),
-      * comps   — the look-alike groups (list of index lists).
-    """
-    conflict, S, Gs = build_conflict(
-        paths, bits_list, gray_list, edge_list, col_list,
-        w_hash, w_gray, w_edge, w_color, sim_threshold, strong_gray_threshold,
-        chunk=chunk, progress=progress)
-
-    def shot_key(i):
-        return (ctimes[i] or "~", os.path.basename(paths[i]))
-
-    comps = [sorted(c, key=shot_key) for c in look_alike_groups(conflict)]
-    comps.sort(key=lambda c: shot_key(c[0]))
-
-    distinct, duplicates = [], []
-    info = {}
-    for c, members in enumerate(comps, 1):
-        gid = f"LA_{c:04d}"
-        rep = members[0]                      # earliest shot of the group
-        for m in members:
-            info[m] = (gid, m == rep, rep)
-        distinct.append(rep)
-        duplicates.extend(m for m in members if m != rep)
-
-    return distinct, duplicates, info, comps, conflict, S, Gs
-
-
-def _log_decisions(paths, comps, info, conflict):
-    """Write a human-readable account of every look-alike group."""
-    n_pairs = int(np.count_nonzero(np.triu(conflict, 1)))
-    multi = [c for c in comps if len(c) > 1]
-    log.info("look-alike groups: %d group(s) with >1 take, %d unique photo(s); "
-             "%d alike pair(s)", len(multi), len(comps) - len(multi), n_pairs)
-    for comp in sorted(multi, key=len, reverse=True):
-        gid, _is_rep, rep = info[comp[0]]
-        extras = ", ".join(os.path.basename(paths[i])
-                           for i in comp if i != rep)
-        log.info("  GROUP %s size=%d  distinct: %s  duplicates: %s",
-                 gid, len(comp), os.path.basename(paths[rep]), extras)
-
-
 def _reset_output(out_dir):
     """Remove this run's own previously produced folders so no stale copies stay.
 
     Only our output directory is touched: `distinct/`, `duplicates/` and the
-    `group_*` folders written by older versions.  Source photos are never
-    touched.
+    `group_*` folders written by older versions.  Source photos and the
+    fingerprint cache are never touched.
     """
     if not os.path.isdir(out_dir):
         return
@@ -385,6 +656,89 @@ def _reset_output(out_dir):
         p = os.path.join(out_dir, name)
         if name.startswith("group_") and os.path.isdir(p):
             shutil.rmtree(p, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Fingerprinting phase (parallel + cached)
+# --------------------------------------------------------------------------- #
+def fingerprint_folder(paths, out_dir, args):
+    """Return (kept_paths, records) — decoding in parallel, with a disk cache."""
+    meta = {
+        "hash_size": args.hash_size,
+        "struct_grid": args.struct_grid,
+        "grid": args.grid,
+        "draft_px": args.draft_px,
+        "version": 2,
+    }
+    cache = {} if args.no_cache else _load_cache(out_dir, meta)
+    records = {}
+    todo = []
+    t0 = time.time()
+    for p in paths:
+        ap = os.path.abspath(p)
+        try:
+            stamp = _stamp(ap)
+        except OSError:
+            continue
+        hit = cache.get(ap)
+        if hit and hit["stamp"] == stamp:
+            records[ap] = hit
+        else:
+            todo.append((ap, stamp))
+
+    cached = len(records)
+    if cached:
+        print(f"  [1/3] {cached} fingerprint(s) from cache, "
+              f"{len(todo)} to decode ...")
+    else:
+        print(f"  [1/3] fingerprinting {len(todo)} image(s) ...")
+
+    if todo:
+        jobs = max(1, args.jobs)
+        if jobs == 1:
+            for k, (ap, stamp) in enumerate(todo, 1):
+                rec = _fingerprint(ap, args.hash_size, args.struct_grid,
+                                   args.grid, args.draft_px)
+                if "error" in rec:
+                    print(f"    [warn] unreadable: {os.path.basename(ap)}")
+                    log.warning("SKIP unreadable: %s (%s)", ap, rec["error"])
+                    continue
+                rec["stamp"] = stamp
+                records[ap] = rec
+                if k % 25 == 0 or k == len(todo):
+                    rate = k / max(time.time() - t0, 1e-6)
+                    print(f"    [{k}/{len(todo)}] {rate:.1f} img/s, "
+                          f"~{(len(todo) - k) / rate:.0f}s left - "
+                          f"{os.path.basename(ap)}")
+        else:
+            with ProcessPoolExecutor(max_workers=jobs) as ex:
+                futs = {ex.submit(_fingerprint_job,
+                                  (ap, args.hash_size, args.struct_grid,
+                                   args.grid, args.draft_px)): (ap, stamp)
+                        for ap, stamp in todo}
+                done = 0
+                for fut in as_completed(futs):
+                    ap, stamp = futs[fut]
+                    done += 1
+                    rec = fut.result()
+                    if rec.get("error"):
+                        print(f"    [warn] unreadable: {os.path.basename(ap)}")
+                        log.warning("SKIP unreadable: %s (%s)",
+                                    ap, rec["error"])
+                        continue
+                    rec["stamp"] = stamp
+                    records[ap] = rec
+                    if done % 25 == 0 or done == len(todo):
+                        rate = done / max(time.time() - t0, 1e-6)
+                        print(f"    [{done}/{len(todo)}] {rate:.1f} img/s, "
+                              f"~{(len(todo) - done) / rate:.0f}s left - "
+                              f"{os.path.basename(ap)}")
+
+    if not args.no_cache and todo:
+        _save_cache(out_dir, meta, records)
+
+    kept = [p for p in paths if os.path.abspath(p) in records]
+    return kept, records
 
 
 # --------------------------------------------------------------------------- #
@@ -402,59 +756,97 @@ def process_folder(folder, out_dir, args):
     log.info("")
     log.info("FOLDER %s  (%d image(s))", folder, len(paths))
 
-    # ---- Phase 1: read each image and build its fingerprint ---------------- #
-    print(f"  [1/3] fingerprinting {len(paths)} image(s) ...")
-    keep, bits_list, gray_list, edge_list, col_list = [], [], [], [], []
-    ctimes = []
-    total = len(paths)
-    t1 = time.time()
-    for idx, p in enumerate(paths, 1):
-        name = os.path.basename(p)
-        b, gv, ev, cv, ct = features_of(p, args.hash_size, args.struct_grid,
-                                        args.grid)
-        if b is None:
-            print(f"    [{idx}/{total}] [warn] unreadable: {name}")
-            log.warning("SKIP unreadable [%d/%d]: %s", idx, total, name)
-            continue
-        keep.append(p)
-        bits_list.append(b)
-        gray_list.append(gv)
-        edge_list.append(ev)
-        col_list.append(cv)
-        ctimes.append(ct)
-        if idx % 25 == 0 or idx == total:
-            rate = idx / max(time.time() - t1, 1e-6)
-            eta = (total - idx) / rate if rate > 0 else 0
-            print(f"    [{idx}/{total}] {rate:.1f} img/s, ~{eta:.0f}s left "
-                  f"- {name}")
-    paths = keep
+    # ---- Phase 1: fingerprint every image (parallel, cached) -------------- #
+    paths, records = fingerprint_folder(paths, out_dir, args)
     if not paths:
         print("  [skip] nothing readable")
         return None
-    print(f"  [1/3] done in {time.time() - t1:.1f}s "
+    print(f"  [1/3] done in {time.time() - t0:.1f}s "
           f"({len(paths)} fingerprint(s))")
 
-    # ---- Phase 2: find look-alike groups, split distinct / duplicates ------ #
-    pairs = len(paths) * (len(paths) - 1) // 2
-    print(f"  [2/3] comparing {len(paths)} image(s) ({pairs} pairs) "
-          f"(alike if combined>= {args.similar_threshold} with weights "
-          f"h/g/e/c = {args.w_hash}/{args.w_gray}/{args.w_edge}/{args.w_color}, "
-          f"or struct>= {args.strong_gray_threshold}) ...")
+    n = len(paths)
+    recs = [records[os.path.abspath(p)] for p in paths]
+    ctimes = [r["ctime"] for r in recs]
+    bits = np.stack([r["bits"] for r in recs]).astype(np.uint8)
+    grays = np.stack([r["gray"].ravel() for r in recs]).astype(np.float32)
+    cols = np.stack([r["col"].reshape(-1) for r in recs]).astype(np.float32)
+    sharp = np.array([r["sharp"] for r in recs], dtype=np.float32)
+
+    # shot order: EXIF capture time, then file name
+    order = sorted(range(n),
+                   key=lambda i: (ctimes[i] or "~", os.path.basename(paths[i])))
+
+    # ---- Phase 2: residual descriptors + candidate comparison ------------- #
+    pairs_all = n * (n - 1) // 2
+    print(f"  [2/3] building descriptors ({n} image(s), "
+          f"{pairs_all} pairs if exhaustive) ...")
     t2 = time.time()
-    (distinct, duplicates, info, comps, conflict,
-     S, Gs) = split_photos(
-        paths, bits_list, gray_list, edge_list, col_list, ctimes,
-        args.w_hash, args.w_gray, args.w_edge, args.w_color,
-        args.similar_threshold, args.strong_gray_threshold, progress=True)
+    RG, RE, RC = build_descriptors(grays, cols, args.struct_grid, args.grid,
+                                   seed=0)
+    del grays, cols
+
+    pairs = candidate_pairs(paths, bits, ctimes, order,
+                            window=args.cand_window,
+                            max_seconds=args.cand_seconds,
+                            hash_bytes_keep=args.cand_hash_bytes,
+                            bucket_cap=args.cand_bucket_cap,
+                            exact_max=args.exact_max)
+    print(f"  [2/3] comparing {len(pairs)} candidate pair(s) "
+          f"({100.0 * len(pairs) / max(pairs_all, 1):.2f}% of exhaustive); "
+          f"alike if combined >= {args.similar_threshold} "
+          f"(w h/g/e/c = {args.w_hash}/{args.w_gray}/{args.w_edge}/{args.w_color}) "
+          f"or structure >= {args.strong_gray_threshold}, "
+          f"link={args.link_mode}")
+
+    weights = (args.w_hash, args.w_gray, args.w_edge, args.w_color)
+    alike, best_any, comb = score_pairs(
+        pairs, RG, RE, RC, bits, weights, args.hash_size * args.hash_size,
+        args.similar_threshold, args.strong_gray_threshold)
+    del RG, RE, RC
+
+    if comb.size:
+        print(f"  [2/3] {len(alike)} alike pair(s); candidate similarity "
+              f"combined p50={np.percentile(comb, 50):.2f} "
+              f"p90={np.percentile(comb, 90):.2f} "
+              f"p99={np.percentile(comb, 99):.2f} max={comb.max():.2f}")
+        log.info("candidate similarity: combined p50=%.3f p90=%.3f p99=%.3f "
+                 "max=%.3f over %d candidate pair(s); %d alike pair(s)",
+                 float(np.percentile(comb, 50)),
+                 float(np.percentile(comb, 90)),
+                 float(np.percentile(comb, 99)), float(comb.max()),
+                 comb.size, len(alike))
+
+    members, cluster_of = cluster_photos(paths, order, alike, args.link_mode)
+
+    # keeper per group: earliest shot (default) or sharpest
+    rank = {i: p for p, i in enumerate(order)}
+    distinct, duplicates, info = [], [], {}
+    comps = []
+    for gi, mem in enumerate(members, 1):
+        mem_sorted = sorted(mem, key=lambda i: (ctimes[i] or "~",
+                                                os.path.basename(paths[i])))
+        if args.keeper == "sharpest":
+            rep = max(mem, key=lambda i: (float(sharp[i]), -rank[i]))
+        else:
+            rep = mem_sorted[0]
+        gid = f"LA_{gi:04d}"
+        for m in mem_sorted:
+            info[m] = (gid, m == rep, rep)
+        distinct.append(rep)
+        duplicates.extend(m for m in mem_sorted if m != rep)
+        comps.append(mem_sorted)
+
+    comps.sort(key=lambda c: (ctimes[c[0]] or "~", os.path.basename(paths[c[0]])))
+    distinct.sort(key=lambda i: (ctimes[i] or "~", os.path.basename(paths[i])))
+    duplicates.sort(key=lambda i: (ctimes[i] or "~", os.path.basename(paths[i])))
     n_multi = sum(1 for c in comps if len(c) > 1)
     print(f"  [2/3] done in {time.time() - t2:.1f}s "
           f"({n_multi} look-alike group(s) -> {len(distinct)} distinct, "
           f"{len(duplicates)} duplicate(s))")
     log.info("[2/3] split %d image(s) in %.1fs: %d look-alike group(s), "
              "%d kept in distinct/, %d in duplicates/",
-             len(paths), time.time() - t2, n_multi, len(distinct),
-             len(duplicates))
-    _log_decisions(paths, comps, info, conflict)
+             n, time.time() - t2, n_multi, len(distinct), len(duplicates))
+    _log_decisions(paths, comps, info)
 
     # ---- Phase 3: copy the two folders + write the reports ----------------- #
     _reset_output(out_dir)
@@ -468,24 +860,26 @@ def process_folder(folder, out_dir, args):
         base = os.path.basename(src)
         if used.get((dest_dir, base)) not in (None, src):
             stem, ext = os.path.splitext(base)
-            n = 1
-            while used.get((dest_dir, f"{stem}_{n}{ext}")) not in (None, src):
-                n += 1
-            base = f"{stem}_{n}{ext}"
+            k = 1
+            while used.get((dest_dir, f"{stem}_{k}{ext}")) not in (None, src):
+                k += 1
+            base = f"{stem}_{k}{ext}"
         used[(dest_dir, base)] = src
         dest = os.path.join(dest_dir, base)
         shutil.copy2(src, dest)
 
     print(f"  [3/3] writing 2 folder(s) to '{out_dir}' ...")
-    for label, members in ((GROUP_DISTINCT, distinct),
-                           (GROUP_DUPLICATES, duplicates)):
+    for label, mem in ((GROUP_DISTINCT, distinct),
+                       (GROUP_DUPLICATES, duplicates)):
         dest_dir = os.path.join(out_dir, label)
         os.makedirs(dest_dir, exist_ok=True)
-        for m in members:
+        for m in mem:
             place(paths[m], dest_dir)
 
-    # highest similarity of each photo to the other takes of its own group
-    # (size-1 groups: to any other photo in the folder)
+    # Highest similarity seen for each photo: against the other takes of its own
+    # group, or — for a photo with no second take — against anything it was
+    # compared with.  `best_any` already came out of the scoring pass, so this
+    # stays O(pairs) and never scans all n photos per image.
     comp_size = {}
     max_sim = {}
     for comp in comps:
@@ -493,15 +887,16 @@ def process_folder(folder, out_dir, args):
         comp_size[cid] = len(comp)
         for m in comp:
             if len(comp) > 1:
-                max_sim[m] = max(float(S[m, o]) for o in comp if o != m)
+                max_sim[m] = max(
+                    (alike[_pair_key(m, o)][0] for o in comp
+                     if o != m and _pair_key(m, o) in alike), default=0.0)
             else:
-                max_sim[m] = max((float(S[m, o]) for o in range(len(paths))
-                                  if o != m), default=0.0)
+                max_sim[m] = float(best_any[m]) if np.isfinite(best_any[m]) else 0.0
 
     rows = []          # [group, file, group_id, group_size, max_sim, dup_of, time]
-    for label, members in ((GROUP_DISTINCT, distinct),
-                           (GROUP_DUPLICATES, duplicates)):
-        for m in members:
+    for label, mem in ((GROUP_DISTINCT, distinct),
+                       (GROUP_DUPLICATES, duplicates)):
+        for m in mem:
             cid, is_rep, rep = info[m]
             rows.append([label,
                          os.path.basename(paths[m]),
@@ -555,12 +950,26 @@ def process_folder(folder, out_dir, args):
     return {
         "folder": folder,
         "out": out_dir,
-        "images": len(paths),
+        "images": n,
         "distinct": len(distinct),
         "duplicates": len(duplicates),
         "groups": n_multi,
+        "pairs": len(pairs),
         "csv": csv_path,
     }
+
+
+def _log_decisions(paths, comps, info):
+    """Write a human-readable account of every look-alike group."""
+    multi = [c for c in comps if len(c) > 1]
+    log.info("look-alike groups: %d group(s) with >1 take, %d unique photo(s)",
+             len(multi), len(comps) - len(multi))
+    for comp in sorted(multi, key=len, reverse=True):
+        gid, _is_rep, rep = info[comp[0]]
+        extras = ", ".join(os.path.basename(paths[i])
+                           for i in comp if i != rep)
+        log.info("  GROUP %s size=%d  distinct: %s  duplicates: %s",
+                 gid, len(comp), os.path.basename(paths[rep]), extras)
 
 
 # --------------------------------------------------------------------------- #
@@ -583,35 +992,71 @@ def build_parser():
                         f"folder (default: {DEFAULT_OUT_NAME})")
     p.add_argument("--hash-size", type=int, default=8,
                    help="pHash bits per side (default 8 -> 64-bit hash)")
-    p.add_argument("--similar-threshold", type=float, default=0.60,
-                   help="min COMBINED similarity (weighted blend of pHash, "
-                        "structure, edge and colour) at which two photos are "
-                        "treated as the same shot; lower = more photos counted "
-                        "as duplicates / fewer kept as distinct (default 0.60)")
-    p.add_argument("--w-hash", type=float, default=0.15,
-                   help="weight of pHash similarity in the combined score. "
-                        "Keep this LOW: on a same-backdrop shoot pHash barely "
-                        "discriminates and would falsely merge different poses "
-                        "(default 0.15)")
-    p.add_argument("--w-gray", type=float, default=0.6,
-                   help="weight of grayscale STRUCTURE correlation — the main "
-                        "signal that tracks composition (default 0.6)")
-    p.add_argument("--w-edge", type=float, default=0.1,
-                   help="weight of edge/outline correlation in the combined "
-                        "score (default 0.1)")
-    p.add_argument("--w-color", type=float, default=0.15,
-                   help="weight of colour correlation in the combined score. "
-                        "Keep this LOW: a shared backdrop gives a high colour "
-                        "score even for different poses (default 0.15)")
-    p.add_argument("--strong-gray-threshold", type=float, default=0.80,
+    p.add_argument("--similar-threshold", type=float, default=0.62,
+                   help="min COMBINED similarity (blend of pHash, structure, "
+                        "edge and colour, measured on the background residual) "
+                        "at which two photos are treated as the same shot; "
+                        "lower = more photos counted as duplicates / fewer kept "
+                        "as distinct (default 0.62)")
+    p.add_argument("--strong-gray-threshold", type=float, default=0.78,
                    help="min grayscale structure correlation at which two "
-                        "photos are duplicates on its own, even if the combined "
-                        "score is low (default 0.80)")
+                        "photos are duplicates on its own (default 0.78)")
+    p.add_argument("--w-hash", type=float, default=0.05,
+                   help="weight of pHash similarity in the combined score "
+                        "(default 0.05)")
+    p.add_argument("--w-gray", type=float, default=0.65,
+                   help="weight of grayscale structure correlation on the "
+                        "background residual — the main signal that tracks the "
+                        "pose (default 0.65)")
+    p.add_argument("--w-edge", type=float, default=0.15,
+                   help="weight of residual edge/outline correlation "
+                        "(default 0.15)")
+    p.add_argument("--w-color", type=float, default=0.15,
+                   help="weight of residual colour correlation (default 0.15)")
     p.add_argument("--grid", type=int, default=16,
                    help="colour correlation grid size, grid x grid (default 16)")
     p.add_argument("--struct-grid", type=int, default=48,
                    help="grayscale structure grid size, grid x grid "
                         "(default 48)")
+    p.add_argument("--link-mode", choices=("complete", "leader", "single"),
+                   default="complete",
+                   help="how groups are formed: 'complete' (default) joins a "
+                        "photo only if it is alike to EVERY member (no "
+                        "chaining); 'leader' joins if alike to the group's "
+                        "keeper (allows drift); 'single' = connected components "
+                        "(old behaviour, chains different poses together)")
+    p.add_argument("--keeper", choices=("earliest", "sharpest"),
+                   default="earliest",
+                   help="which take is kept in distinct/ (default: earliest)")
+    p.add_argument("--cand-window", type=int, default=12,
+                   help="compare each photo with the N photos around it in shot "
+                        "order (default 12)")
+    p.add_argument("--cand-seconds", type=float, default=30.0,
+                   help="also compare photos taken within this many seconds of "
+                        "each other (default 30; 0 disables)")
+    p.add_argument("--cand-hash-bytes", type=int, default=5,
+                   help="pHash multi-index: compare pairs agreeing on at least "
+                        "this many of the 8 hash bytes, to catch repeated shots "
+                        "far apart in time (default 5; 0 disables)")
+    p.add_argument("--cand-bucket-cap", type=int, default=400,
+                   help="ignore pHash byte buckets larger than this many photos "
+                        "(they carry no signal and would explode the pair "
+                        "count) (default 400)")
+    p.add_argument("--exact-max", type=int, default=600,
+                   help="folders with at most this many photos are compared "
+                        "exhaustively (every pair), no candidate heuristics "
+                        "(default 600)")
+    p.add_argument("--jobs", type=int,
+                   default=max(1, min(8, (os.cpu_count() or 2) - 1)),
+                   help="parallel decoding processes (default: CPU count - 1, "
+                        "capped at 8)")
+    p.add_argument("--draft-px", type=int, default=384,
+                   help="decode JPEGs straight down to this size for "
+                        "fingerprinting (default 384; bigger = slower, no real "
+                        "gain)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="ignore/refresh the fingerprint cache in the output "
+                        "folder")
     return p
 
 
@@ -630,10 +1075,14 @@ def main():
     log.info("root=%s  out_name=%s  python=%s", os.path.abspath(root),
              args.out_name, sys.version.split()[0])
     log.info("settings: hash_size=%d alike_if_combined>=%.2f weights h/g/e/c="
-             "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f grid=%d struct_grid=%d",
+             "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f grid=%d struct_grid=%d "
+             "link=%s keeper=%s draft_px=%d jobs=%d cand_window=%d "
+             "cand_seconds=%.0f cand_hash_bytes=%d exact_max=%d",
              args.hash_size, args.similar_threshold, args.w_hash, args.w_gray,
              args.w_edge, args.w_color, args.strong_gray_threshold, args.grid,
-             args.struct_grid)
+             args.struct_grid, args.link_mode, args.keeper, args.draft_px,
+             args.jobs, args.cand_window, args.cand_seconds,
+             args.cand_hash_bytes, args.exact_max)
     log.info("image folders found (%d):", len(folders))
     for f in folders:
         log.info("  - %s", os.path.relpath(f, root))
