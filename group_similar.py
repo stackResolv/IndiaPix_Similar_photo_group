@@ -731,14 +731,53 @@ def find_image_folders(root, out_name):
     return folders
 
 
+def _same_file(a, b):
+    """True when `a` and `b` are the same entry on disk (not two copies)."""
+    try:
+        sa, sb = os.stat(a), os.stat(b)
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def _same_content(a, b):
+    """Byte-for-byte comparison, size short-circuit first.
+
+    Used only to recognise a photo that an EARLIER run already placed in the
+    output folder, so a re-run in move mode finishes the move (drops the now
+    redundant source copy) instead of leaving the folder half full.
+    """
+    if _same_file(a, b):
+        return True
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                ba, bb = fa.read(1 << 20), fb.read(1 << 20)
+                if ba != bb:
+                    return False
+                if not ba:
+                    return True
+    except OSError:
+        return False
+
+
 def _transfer(src, dest, move):
     """Put one photo at `dest` — by moving it (move=True) or copying it.
 
-    Moving is what saves the disk space: there is never a second full copy of
-    every duplicate.
+    Moving is the DEFAULT: a 28k-photo shoot would otherwise be stored twice.
       * same volume  -> os.rename, which is instant and needs no extra space;
       * other volume -> shutil.move (copy, then unlink the source).
+    Copying (--copy) leaves the originals where they are.
+
+    `dest` is never allowed to be silently overwritten: the caller has already
+    picked a free name, and this re-checks so a race or a stale name can never
+    destroy the only copy of a photo.
     """
+    if os.path.exists(dest) and not _same_file(src, dest):
+        raise FileExistsError(errno.EEXIST,
+                              f"refusing to overwrite {dest}", dest)
     if not move:
         shutil.copy2(src, dest)
         return
@@ -748,6 +787,73 @@ def _transfer(src, dest, move):
         if e.errno != errno.EXDEV:
             raise
         shutil.move(src, dest)
+
+
+def place_photo(src, dest_dir, move=True):
+    """Put one photo into `dest_dir` and report what actually happened.
+
+    Returns one of:
+      'moved'  — the file was transferred and the source entry is gone
+                 (os.rename, or copy+unlink across volumes);
+      'copied' — copy mode: the source was left alone;
+      'deduped'— an IDENTICAL copy was already in `dest_dir` from an earlier
+                 run, so the now-redundant source entry was deleted (this is
+                 what finishes a move that a previous copy-run left half done);
+      'kept'   — copy mode, identical copy already present, nothing to do.
+
+    A photo is never overwritten: an occupied name with different content gets
+    a numeric suffix, and an occupied name with the SAME content is treated as
+    "already placed" rather than being replaced.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    stem, ext = os.path.splitext(os.path.basename(src))
+    k = 0
+    while True:
+        name = f"{stem}{ext}" if k == 0 else f"{stem}_{k}{ext}"
+        target = os.path.join(dest_dir, name)
+        if not os.path.exists(target):
+            _transfer(src, target, move)
+            return "moved" if move else "copied"
+        if _same_content(src, target):
+            # Already here from an earlier run.  In move mode the source copy is
+            # now redundant, so drop it — that completes the interrupted move.
+            if move and not _same_file(src, target):
+                os.remove(src)
+                return "deduped"
+            return "kept"
+        k += 1
+        if k > 9999:
+            raise RuntimeError(f"too many name collisions for {src}")
+
+
+def _prune_stale(out_dir, intended, move, dry):
+    """Delete a photo's copy when it sits in the WRONG output folder.
+
+    Move mode never wipes `distinct/` or `duplicates/` (they may be the only
+    copy left), so a re-run that classifies a photo differently — or a
+    copy-run followed by a move-run — would otherwise leave the photo in both
+    folders.  A file is only removed when the correct placement exists AND the
+    two files are byte-identical, so this can never delete a different photo.
+    """
+    if dry or not move:
+        return 0
+    removed = 0
+    for src, label in intended.items():
+        other = (GROUP_DUPLICATES if label == GROUP_DISTINCT
+                 else GROUP_DISTINCT)
+        base = os.path.basename(src)
+        stale = os.path.join(out_dir, other, base)
+        good = os.path.join(out_dir, label, base)
+        if (os.path.isfile(stale) and os.path.isfile(good)
+                and _same_content(stale, good)):
+            try:
+                os.remove(stale)
+                removed += 1
+                log.info("pruned stale placement: %s/%s (moved to %s/)",
+                         other, base, label)
+            except OSError as e:
+                log.warning("could not prune %s: %s", stale, e)
+    return removed
 
 
 def _reset_output(out_dir, keep_existing=False, source_has_images=True):
@@ -1009,7 +1115,9 @@ def process_folder(folder, out_dir, args):
     _log_decisions(paths, comps, info)
 
     # ---- Phase 3: place the photos + write the reports -------------------- #
-    move = bool(getattr(args, "move", False))
+    # MOVE is the default: a separated shoot should not exist twice on disk.
+    # --copy opts back into the old non-destructive behaviour.
+    move = not bool(getattr(args, "copy", False))
     dry = bool(getattr(args, "dry_run", False))
 
     if dry:
@@ -1021,42 +1129,52 @@ def process_folder(folder, out_dir, args):
         # to them, never clear them.
         os.makedirs(out_dir, exist_ok=True)
         print(f"  [3/3] MOVING photos into 2 folder(s) to '{out_dir}' "
-              f"(originals leave the source folder) ...")
-        log.info("MOVE mode: existing output kept, nothing is deleted")
+              f"(originals leave the source folder; use --copy to keep them "
+              f"in place) ...")
+        log.info("MOVE mode (default): existing output kept, nothing deleted")
     else:
         _reset_output(out_dir, source_has_images=bool(paths))
         os.makedirs(out_dir, exist_ok=True)
-        print(f"  [3/3] copying photos into 2 folder(s) to '{out_dir}' ...")
+        print(f"  [3/3] COPYING photos into 2 folder(s) to '{out_dir}' "
+              f"(originals stay where they are) ...")
+        log.info("COPY mode (--copy): source folder left untouched")
 
-    # collision-safe naming (matters only when two folders share file names)
-    used = {}
-
-    def place(src, dest_dir):
-        if dry:
-            return
-        os.makedirs(dest_dir, exist_ok=True)
-        base = os.path.basename(src)
-        if used.get((dest_dir, base)) not in (None, src):
-            stem, ext = os.path.splitext(base)
-            k = 1
-            while used.get((dest_dir, f"{stem}_{k}{ext}")) not in (None, src):
-                k += 1
-            base = f"{stem}_{k}{ext}"
-        used[(dest_dir, base)] = src
-        _transfer(src, os.path.join(dest_dir, base), move)
-
+    intended = {}
+    stats = {}
     for label, mem in ((GROUP_DISTINCT, distinct),
                        (GROUP_DUPLICATES, duplicates)):
         dest_dir = os.path.join(out_dir, label)
         if not dry:
             os.makedirs(dest_dir, exist_ok=True)
         for m in mem:
-            place(paths[m], dest_dir)
+            src = paths[m]
+            intended[src] = label
+            if dry:
+                continue
+            st = place_photo(src, dest_dir, move)
+            stats[st] = stats.get(st, 0) + 1
 
     if move and not dry:
-        log.info("MOVE mode: %d photo(s) relocated out of the source folder",
-                 n)
-        print(f"  moved            : {n} photo(s) left the source folder")
+        placed = stats.get("moved", 0) + stats.get("deduped", 0)
+        left = sum(1 for p in paths if os.path.exists(p))
+        print(f"  moved            : {placed} photo(s) now live only in "
+              f"{os.path.basename(out_dir)}/")
+        if stats.get("deduped"):
+            print(f"  finished moves   : {stats['deduped']} photo(s) were "
+                  f"already in the output folder - the leftover source copy "
+                  f"was removed")
+        if left:
+            print(f"  [warn] {left} source file(s) could not be removed")
+            log.warning("%d source file(s) remain after the move", left)
+        pruned = _prune_stale(out_dir, intended, move, dry)
+        if pruned:
+            print(f"  corrected        : {pruned} photo(s) removed from the "
+                  f"wrong output folder (re-classified by this run)")
+        log.info("MOVE mode: %d photo(s) live in the output folder only, "
+                 "%d stale placement(s) pruned", placed, pruned)
+    elif not dry:
+        log.info("COPY mode: %d photo(s) copied, originals untouched",
+                 stats.get("copied", 0))
 
     # Highest similarity seen for each photo: against the other takes of its own
     # group, or — for a photo with no second take — against anything it was
@@ -1249,14 +1367,20 @@ def build_parser():
                    help="fingerprint/analyse only the first N photos of each "
                         "folder (default 0 = all). Useful for a quick "
                         "threshold trial on a huge folder")
+    p.add_argument("--copy", action="store_true",
+                   help="COPY the photos into distinct/ + duplicates/ and "
+                        "leave the originals in the source folder. NOT the "
+                        "default: moving is, because a separated shoot should "
+                        "not be stored twice on disk")
     p.add_argument("--move", action="store_true",
-                   help="MOVE the photos into distinct/ + duplicates/ instead "
-                        "of copying them. Saves the full second copy on disk, "
-                        "but the originals LEAVE the source folder - run "
-                        "--dry-run first to check the grouping")
+                   help="(kept for compatibility; moving is already the "
+                        "default)")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="skip the confirmation prompt (moving is the default, "
+                        "so this makes the run non-interactive)")
     p.add_argument("--dry-run", action="store_true",
                    help="analyse and print what WOULD happen, writing and "
-                        "moving nothing. Use this to sanity-check --move")
+                        "moving nothing. Use this to sanity-check a move")
     return p
 
 
@@ -1291,20 +1415,25 @@ def main():
             sys.exit(0)
         sys.exit(f"error: no folders containing images found under '{root}'")
 
-    if args.move and not args.dry_run:
+    if not args.copy and not args.dry_run:
         # Moving is irreversible for the source folder, so make the user say so.
-        print("MOVE mode: photos will be MOVED out of the source folders into "
-              "distinct/ and duplicates/.\n"
+        print("MOVE mode (default): photos will be MOVED out of the source "
+              "folders into distinct/ and duplicates/.\n"
               "Nothing is deleted, but the originals will no longer be in "
-              "their original folder.\n"
-              "Tip: run with --dry-run first to review the grouping, and keep "
-              "a backup of anything irreplaceable.")
-        try:
-            answer = input("Continue? [y/N] ").strip().lower()
-        except EOFError:
-            answer = ""
-        if answer not in ("y", "yes"):
-            sys.exit("aborted: nothing was moved")
+              "their original folder. Use --copy to keep them in place, or "
+              "--dry-run to preview the grouping first.")
+        if args.yes:
+            print("  --yes given: continuing without a prompt")
+            log.info("move confirmed via --yes")
+        else:
+            try:
+                answer = input("Continue? [Y/n] ").strip().lower()
+            except EOFError:
+                answer = "y"
+                print("  no console available -> continuing (pass --yes to "
+                      "silence this, or --dry-run to preview)")
+            if answer not in ("", "y", "yes"):
+                sys.exit("aborted: nothing was moved")
 
     log_path = setup_logging(os.path.join(root, "group_similar.log"))
     log.info("=== group_similar run start ===")
@@ -1313,12 +1442,13 @@ def main():
     log.info("settings: hash_size=%d alike_if_combined>=%.2f weights h/g/e/c="
              "%.2f/%.2f/%.2f/%.2f strong_gray>=%.2f grid=%d struct_grid=%d "
              "link=%s keeper=%s draft_px=%d jobs=%d cand_window=%d "
-             "cand_seconds=%.0f cand_hash_bytes=%d exact_max=%d",
+             "cand_seconds=%.0f cand_hash_bytes=%d exact_max=%d place=%s",
              args.hash_size, args.similar_threshold, args.w_hash, args.w_gray,
              args.w_edge, args.w_color, args.strong_gray_threshold, args.grid,
              args.struct_grid, args.link_mode, args.keeper, args.draft_px,
              args.jobs, args.cand_window, args.cand_seconds,
-             args.cand_hash_bytes, args.exact_max)
+             args.cand_hash_bytes, args.exact_max,
+             "copy" if args.copy else "move")
     log.info("image folders found (%d):", len(folders))
     for f in folders:
         log.info("  - %s", os.path.relpath(f, root))
